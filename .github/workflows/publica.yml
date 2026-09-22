@@ -1,0 +1,165 @@
+# Feeds a GitHub Pages: las piezas y el CSV viven en este mismo repo y se sirven por Pages.
+# En el repo va como .github/workflows/publica.yml (lo copia app/armar-repo.js).
+#
+# Se acabó el ZIP: cada feed tiene una URL fija que se sobrescribe en cada corrida
+#   https://<dueño>.github.io/<repo>/<tienda>/<nombre>/feed.csv
+# Esa URL se pega UNA vez en el catálogo de Meta (o TikTok) y ya no se toca nunca más.
+#
+# Tres pasos, como en el sistema que ya lleva meses funcionando:
+#   recetas  → qué feeds tocan esta hora y en cuántas partes se reparte cada uno
+#   dibujar  → N máquinas en paralelo; cada una dibuja SOLO las piezas que faltan (caché = estado.json)
+#   unir     → una sola máquina junta las partes, escribe el CSV, poda y hace UN commit
+# Solo «unir» empuja: si empujaran las partes se pisarían entre ellas.
+#
+# Antes de la primera corrida: Settings > Pages > Source: Deploy from a branch, Branch: main, carpeta /docs.
+name: Feeds a Pages
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: 'tienda/nombre (vacío = las que tocan esta hora)'
+        required: false
+      partes:
+        description: 'en cuántas partes repartir (vacío = lo que diga la receta)'
+        required: false
+      limite:
+        description: 'solo los primeros N productos (vacío = todo el catálogo). Para la primera prueba.'
+        required: false
+
+# Para el commit de las piezas alcanza el token que GitHub da solo: no hace falta ningún secreto.
+permissions:
+  contents: write
+
+# Nunca dos corridas a la vez sobre el mismo repo: la segunda espera, no pisa.
+concurrency:
+  group: publica-pages
+  cancel-in-progress: false
+
+jobs:
+  recetas:
+    runs-on: ubuntu-latest
+    outputs:
+      matriz: ${{ steps.l.outputs.matriz }}
+      feeds: ${{ steps.l.outputs.feeds }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: auto/recetas
+      - id: l
+        env:
+          SLUG_MANUAL: ${{ github.event.inputs.slug }}
+          PARTES_MANUAL: ${{ github.event.inputs.partes }}
+        run: |
+          export HORA=$(TZ=America/Lima date +%H:00)
+          echo "Hora de Lima: $HORA"
+          node -e '
+            const fs = require("fs"), path = require("path");
+            const hora = process.env.HORA, manual = (process.env.SLUG_MANUAL || "").trim();
+            const pManual = Number(process.env.PARTES_MANUAL) || 0;
+            const raiz = "auto/recetas", feeds = [], matriz = [];
+            for (const t of fs.existsSync(raiz) ? fs.readdirSync(raiz, { withFileTypes: true }) : []) {
+              if (!t.isDirectory()) continue;
+              for (const f of fs.readdirSync(path.join(raiz, t.name))) {
+                if (!f.endsWith(".json")) continue;
+                const slug = t.name + "/" + f.slice(0, -5);
+                let r; try { r = JSON.parse(fs.readFileSync(path.join(raiz, t.name, f), "utf8")); } catch { continue; }
+                if (manual) { if (slug !== manual) continue; }
+                else {
+                  if (r.activo === false) continue;
+                  const horas = Array.isArray(r.horas) && r.horas.length ? r.horas : ["07:00", "15:00"];
+                  if (!horas.includes(hora)) continue;
+                }
+                // Tope de 20 jobs en paralelo en el plan gratuito; con 1 parte igual funciona (más lento).
+                const de = Math.min(20, Math.max(1, pManual || Number(r.partes) || 8));
+                feeds.push({ slug, de });
+                for (let k = 0; k < de; k++) matriz.push({ slug, parte: k, de });
+              }
+            }
+            const salida = process.env.GITHUB_OUTPUT;
+            fs.appendFileSync(salida, "matriz=" + JSON.stringify(matriz) + "\n");
+            fs.appendFileSync(salida, "feeds=" + JSON.stringify(feeds) + "\n");
+            console.log(feeds.length ? feeds.map(f => f.slug + " en " + f.de + " partes").join("\n") : "Ninguna receta toca esta hora");
+          '
+
+  dibujar:
+    needs: recetas
+    if: needs.recetas.outputs.matriz != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        tarea: ${{ fromJson(needs.recetas.outputs.matriz) }}
+    steps:
+      # Lo más importante de todo: la copia NO se trae docs/**/img/. Son decenas de miles de fotos
+      # y esta máquina no necesita ninguna: para saber qué ya existe le basta estado.json.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            /*
+            !/docs/*/*/img/
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Fuentes (Arial se reemplaza por Liberation Sans, de las mismas medidas)
+        run: sudo apt-get install -y -qq fonts-liberation > /dev/null
+      - name: Dibujar
+        env:
+          LIMITE: ${{ github.event.inputs.limite }}
+        run: |
+          # Solo dígitos: lo que se escribe en el formulario nunca entra crudo en la línea de comandos.
+          LIM=$(printf '%s' "$LIMITE" | tr -cd '0-9')
+          node app/publica.js "${{ matrix.tarea.slug }}" --parte ${{ matrix.tarea.parte }} --de ${{ matrix.tarea.de }} ${LIM:+--limite $LIM}
+      - name: Guardar lo dibujado para el paso de unir
+        uses: actions/upload-artifact@v4
+        with:
+          name: parte-${{ strategy.job-index }}
+          path: |
+            docs/*/*/img
+            docs/*/*/partes
+          if-no-files-found: error
+          retention-days: 1
+
+  unir:
+    needs: [recetas, dibujar]
+    if: ${{ always() && needs.recetas.outputs.matriz != '[]' && needs.dibujar.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # Las piezas nuevas caen encima de docs/, junto a las que ya estaban.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: parte-*
+          path: .
+          merge-multiple: true
+      - name: Unir las partes y escribir el CSV
+        env:
+          FEEDS: ${{ needs.recetas.outputs.feeds }}
+        run: |
+          echo "$FEEDS" | node -e '
+            let t = ""; process.stdin.on("data", d => t += d).on("end", () => {
+              for (const f of JSON.parse(t)) console.log(f.slug + " " + f.de);
+            });
+          ' > lista.txt
+          while read -r slug de; do
+            node app/publica.js "$slug" --unir --de "$de"
+          done < lista.txt
+          rm -f lista.txt
+      - name: Un solo commit, un solo push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A docs
+          git diff --cached --quiet && { echo "Nada cambió"; exit 0; }
+          git commit -m "Feeds a Pages: $(TZ=America/Lima date '+%Y-%m-%d %H:%M') (Lima)"
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
+          git push origin "HEAD:${GITHUB_REF_NAME}"

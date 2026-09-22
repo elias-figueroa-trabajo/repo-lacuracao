@@ -1,0 +1,7 @@
+publicado/
+datos/
+publicar.env
+*.env
+node_modules/
+docs/*/*/partes/
+docs/*/*/fin.json
