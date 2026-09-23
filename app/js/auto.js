@@ -5,8 +5,16 @@ import { formatos } from './config.js';
 import { leerFeed, filaMeta } from './feeds.js';
 import { renderPng, SALIDA_FEED } from './lienzo.js';
 
-const HILOS = 6, AVISO_CADA = 500;
+const HILOS = 2, AVISO_CADA = 200;
 const ESPERAS = [5000, 15000, 40000]; // reintentos de foto, en ms
+// Cuando la tienda corta en seco (todas las fotos dan 502/503 en esa maquina) la espera creciente
+// se vuelve una trampa: 60 s por producto, y una parte entera se va en horas antes de morir.
+// Le paso el 2026-09-23 a la parte 6 de 8 de lacuracao/catalogo: 1.000 productos, 0 piezas
+// dibujadas, 4 h en pie y la corrida completa perdida porque `unir` no llega a correr.
+const RAFAGA = 10;        // fallos seguidos a partir de los cuales ya no se reintenta (no es transitorio)
+const CORTE = 40;         // fallos seguidos = la tienda nos corto, no son fotos rotas sueltas
+const PAUSA = 180e3;      // tregua antes de volver a intentar
+const PAUSAS_MAX = 3;     // a la tercera se abandona la parte con un mensaje claro
 const params = new URLSearchParams(location.search), slug = params.get('slug') || '';
 const limite = Number(params.get('limite')) || 0; // solo para pruebas: corta el feed a N productos
 // Reparto en varias máquinas (app/publica.js): esta página dibuja 1 de cada `de` productos.
@@ -81,6 +89,21 @@ async function correr() {
 
   const res = new Array(cola.length);
   let i = 0, hechas = 0, dibujadas = 0, atrasadas = 0;
+  // Freno de tienda caida: lo comparten los hilos, asi una sola tregua los para a todos.
+  let seguidas = 0, pausas = 0, tregua = null;
+  async function frenar() {
+    if (tregua) return tregua;
+    if (++pausas > PAUSAS_MAX) {
+      throw new Error(`La tienda dejo de entregar fotos: ${CORTE} seguidas fallaron ${PAUSAS_MAX} veces seguidas. `
+        + `Se abandona esta parte en vez de quemar el plazo (se rehace en la proxima corrida).`);
+    }
+    tregua = (async () => {
+      await progreso(`${CORTE} fotos seguidas fallaron: tregua de ${PAUSA / 60e3} min (pausa ${pausas} de ${PAUSAS_MAX})`);
+      await new Promise(r => setTimeout(r, PAUSA));
+      seguidas = 0; tregua = null;
+    })();
+    return tregua;
+  }
   // Si no se puede dibujar ahora, se deja la pieza anterior solo si muestra el mismo precio
   // (cambió la plantilla o el título, no el precio). Queda con su firma vieja: la próxima corrida la rehace.
   const anterior = t => {
@@ -99,18 +122,19 @@ async function correr() {
         // Espera creciente, como el sistema que ya lleva 2 meses en producción (backoff 1,5):
         // con un solo reintento a los 5 s, una racha de 30 s dejaba el producto fuera del CSV.
         for (const espera of ESPERAS) {
-          if (!sinFoto) break;
+          // En plena racha de fallos no se reintenta: esperar 60 s por producto solo alarga la agonia.
+          if (!sinFoto || seguidas >= RAFAGA) break;
           await new Promise(r => setTimeout(r, espera));
           ({ blob, sinFoto } = await renderPng(receta.plantilla, fmt, t.p, 'image/jpeg', SALIDA_FEED));
         }
-        if (sinFoto) { res[n] = anterior(t); if (!res[n]) fuera['sin foto']++; } // la foto no cargó: mejor fuera que una pieza vacía
+        if (sinFoto) { res[n] = anterior(t); if (!res[n]) fuera['sin foto']++; if (++seguidas >= CORTE) await frenar(); } // la foto no cargó: mejor fuera que una pieza vacía
         else {
           await pedir(`/publicar/auto-img${q}&archivo=${encodeURIComponent(t.archivo)}`, { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: blob });
-          dibujadas++;
+          dibujadas++; seguidas = 0; // la tienda responde: se reinicia el contador del freno
           res[n] = t;
         }
       }
-      if (++hechas % AVISO_CADA === 0) progreso(`${hechas} de ${cola.length} (${dibujadas} dibujadas)`);
+      if (++hechas % AVISO_CADA === 0) progreso(`${hechas} de ${cola.length} (${dibujadas} dibujadas, ${fuera['sin foto']} sin foto)`);
     }
   }
   await Promise.all(Array.from({ length: HILOS }, hilo));

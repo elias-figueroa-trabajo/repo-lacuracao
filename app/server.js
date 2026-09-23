@@ -358,6 +358,162 @@ function opEstiloMarca(e, out) {
   out(200, limpia);
 }
 
+// ---------- EFE Ads y MartechHub: los MVP dejan de escribir por el upsert genérico (2026-09-23) ----------
+// Estas cinco tablas nacieron como MVP y guardaban sin validar nada en el servidor: se podía inventar
+// un space_id, cruzar dos confirmadas mandando media fila (sin `estado` el choque no se miraba),
+// aprobar una tarea sin evidencia o meter en `modo` un texto que el publicador pinta dentro de un
+// atributo `class`. Ahora pasan por validador propio, como pedidos, precios o aprobaciones.
+const SITIOS_ADS = ['efe', 'lc', 'jz', 'mc']; // prefijo del space_id; espejo de SITIOS en js/comun.js
+const MODOS = ['reemplazar', 'inyectar'];
+const EST_ESP = ['activo', 'pausado'];
+const EST_RES = ['tentativa', 'confirmada', 'cancelada'];
+const EST_TIENDA = ['activa', 'cerrada'];
+const EST_TAR = ['pendiente', 'enviada', 'aprobada', 'rechazada'];
+const PARTE_ID = /^[a-z0-9]{1,20}$/;
+// Número de negocio: nada de negativos, NaN, "Infinity" ni cifras absurdas que deformen el reporte.
+const numOk = (v, tope) => { const n = Number(v); return v !== '' && Number.isFinite(n) && n >= 0 && n <= tope; };
+// La semana de un resultado siempre es su lunes: así la misma semana no entra dos veces con otra fecha.
+const lunesDe = s => { const d = new Date(s + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7)); return d.toISOString().slice(0, 10); };
+// Fila final = lo guardado + lo que llega. Validar solo lo que llega deja pasar la actualización parcial.
+const fusion = (t, fila, prev) => Object.fromEntries(TABLAS[t].map(c => [c, String(fila[c] ?? (prev ? prev[c] : '')).trim()]));
+
+function opEspacio(fila, out) {
+  const filas = leerCsv('espacios'), i = filas.findIndex(r => r.space_id === String(fila.space_id)), prev = i >= 0 ? filas[i] : null;
+  const e = fusion('espacios', fila, prev);
+  // Manda el id (§4: los IDs maestros no se falsean): sitio, página y posición son sus propias partes.
+  const p = e.space_id.split('_');
+  if (p.length !== 4 || !SITIOS_ADS.includes(p[0]) || !PARTE_ID.test(p[1]) || !PARTE_ID.test(p[2]) || !/^\d{1,2}$/.test(p[3]))
+    return out(400, { error: 'space_id no válido: {sitio}_{pagina}_{posicion}_{n}, con sitio ' + SITIOS_ADS.join('/') });
+  if (e.sitio !== p[0] || e.pagina !== p[1] || e.posicion !== p[2]) return out(400, { error: 'El sitio, la página y la posición tienen que coincidir con el space_id' });
+  if (!MODOS.includes(e.modo)) return out(400, { error: 'Modo no válido: ' + MODOS.join(' o ') });
+  if (!EST_ESP.includes(e.estado)) return out(400, { error: 'Estado no válido: ' + EST_ESP.join(' o ') });
+  if (e.medidas.length > 40) return out(400, { error: 'Medidas demasiado largas' });
+  // El selector viaja tal cual al JSON que lee el script del sitio: desde aquí no se cierra una etiqueta.
+  if (e.selector.length > 200 || /[<>`\\]/.test(e.selector)) return out(400, { error: 'Selector no válido' });
+  if (e.modo === 'reemplazar' && !e.selector) return out(400, { error: 'El modo reemplazar necesita el selector del sitio' });
+  if (!numOk(e.precio_semana, 1e7)) return out(400, { error: 'Precio por semana no válido' });
+  if (!numOk(e.imp_semana, 1e10)) return out(400, { error: 'Impresiones por semana no válidas' });
+  if (e.notas.length > 300) return out(400, { error: 'La nota no puede pasar de 300 caracteres' });
+  if (prev) filas[i] = e; else filas.push(e);
+  escribirCsv('espacios', filas);
+  out(200, e);
+}
+
+function opReserva(fila, out) {
+  const filas = leerCsv('reservas'), i = filas.findIndex(r => r.id === String(fila.id)), prev = i >= 0 ? filas[i] : null;
+  const r = fusion('reservas', fila, prev);
+  if (!leerCsv('espacios').some(e => e.space_id === r.space_id)) return out(400, { error: 'Ese espacio no existe en el inventario' });
+  if (!EST_RES.includes(r.estado)) return out(400, { error: 'Estado no válido: ' + EST_RES.join(', ') });
+  if (!diaOk(r.inicio) || !diaOk(r.fin)) return out(400, { error: 'Fechas no válidas: van como AAAA-MM-DD y tienen que ser días reales' });
+  if (r.fin < r.inicio) return out(400, { error: 'La fecha de fin va después de la de inicio' });
+  if (!nombreOk(r.anunciante)) return out(400, { error: 'Falta el anunciante' });
+  if (!nombreOk(r.quien)) return out(400, { error: 'Falta quién reserva' });
+  if (r.campaign_id) {
+    const camp = leerCsv('campanas').find(c => c.campaign_id === r.campaign_id);
+    if (!camp) return out(400, { error: 'Esa campaña no existe en Brief y calendario' });
+    if (camp.estado === 'cancelada' && (!prev || prev.campaign_id !== r.campaign_id)) return out(400, { error: 'Esa campaña está cancelada' });
+  }
+  if (!numOk(r.precio, 1e7)) return out(400, { error: 'Precio no válido' });
+  if (r.pieza_url && !piezaOk(r.pieza_url)) return out(400, { error: 'La pieza tiene que ser una URL http(s) sin usuario ni clave' });
+  if (r.destino && !urlLimpia(r.destino)) return out(400, { error: 'El destino tiene que ser una URL http(s) sin usuario ni clave' });
+  // El choque se mira sobre la fila final, no sobre lo que mandó el cliente.
+  const choca = r.estado === 'confirmada' && filas.find(x => x.id !== r.id && x.space_id === r.space_id &&
+    x.estado === 'confirmada' && x.inicio <= r.fin && r.inicio <= x.fin);
+  if (choca) return out(409, { error: `Ese espacio ya está confirmado para ${choca.anunciante} del ${choca.inicio} al ${choca.fin}` });
+  r.creado = prev ? (prev.creado || r.creado) : new Date().toISOString();
+  if (prev) filas[i] = r; else filas.push(r);
+  escribirCsv('reservas', filas);
+  out(200, r);
+}
+
+function opResultado(fila, out) {
+  const filas = leerCsv('resultados'), i = filas.findIndex(r => r.id === String(fila.id)), prev = i >= 0 ? filas[i] : null;
+  const x = fusion('resultados', fila, prev);
+  if (!leerCsv('reservas').some(r => r.id === x.reserva_id)) return out(400, { error: 'Esa reserva no existe' });
+  if (!diaOk(x.semana)) return out(400, { error: 'Semana no válida (AAAA-MM-DD)' });
+  x.semana = lunesDe(x.semana);
+  if (filas.some(r => r.id !== x.id && r.reserva_id === x.reserva_id && r.semana === x.semana))
+    return out(409, { error: 'Esa semana ya está cargada para esta reserva: edita la que existe' });
+  for (const k of ['impresiones', 'clics', 'unidades'])
+    if (!numOk(x[k], 1e10) || !Number.isInteger(Number(x[k]))) return out(400, { error: 'Valor no válido en ' + k + ': va un número entero de 0 para arriba' });
+  if (!numOk(x.venta, 1e9)) return out(400, { error: 'Venta no válida' });
+  if (Number(x.clics) > Number(x.impresiones)) return out(400, { error: 'No puede haber más clics que impresiones' });
+  if (x.fuente.length > 40) return out(400, { error: 'Fuente demasiado larga' });
+  if (prev) filas[i] = x; else filas.push(x);
+  escribirCsv('resultados', filas);
+  out(200, x);
+}
+
+function opTienda(fila, out) {
+  const filas = leerCsv('tiendas'), i = filas.findIndex(r => r.store_id === String(fila.store_id)), prev = i >= 0 ? filas[i] : null;
+  const t = fusion('tiendas', fila, prev);
+  if (!/^[a-z0-9_]{3,40}$/.test(t.store_id)) return out(400, { error: 'store_id no válido: de 3 a 40 caracteres [a-z0-9_]' });
+  if (!nombreOk(t.nombre)) return out(400, { error: 'Falta el nombre de la tienda' });
+  if (!MARCAS.includes(t.marca)) return out(400, { error: 'Marca no válida: ' + MARCAS.join(', ') });
+  if (!nombreOk(t.zona)) return out(400, { error: 'Falta la zona' });
+  if (!EST_TIENDA.includes(t.estado)) return out(400, { error: 'Estado no válido: ' + EST_TIENDA.join(' o ') });
+  for (const k of ['ciudad', 'responsable']) if (t[k] && !nombreOk(t[k])) return out(400, { error: 'Valor no válido en ' + k });
+  if (prev) filas[i] = t; else filas.push(t);
+  escribirCsv('tiendas', filas);
+  out(200, t);
+}
+
+// Tareas por tienda: estado previo → estados a los que puede pasar. Sin esto, «pendiente» saltaba
+// directo a «aprobada» y el cumplimiento (el KPI del sistema) se podía inflar sin subir una foto.
+const MOV_T = {
+  pendiente: ['pendiente', 'enviada'], enviada: ['enviada', 'aprobada', 'rechazada'],
+  rechazada: ['rechazada', 'enviada', 'pendiente'], aprobada: ['aprobada', 'pendiente', 'enviada'],
+};
+const EVID_RE = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
+const EVID_MAX = 1.5e6; // el cliente reduce a 800 px (~60 KB); el tope es contra quien no pase por él
+function opTarea(fila, out) {
+  const filas = leerCsv('tareas_tienda'), i = filas.findIndex(r => r.id === String(fila.id)), prev = i >= 0 ? filas[i] : null;
+  const a = fusion('tareas_tienda', fila, prev);
+  if (prev && String(fila._base || '') !== prev.actualizado) return out(409, { error: 'Otra persona cambió esta tarea. Se cargó lo último: vuelve a hacer tu cambio.' });
+  const camp = leerCsv('campanas').find(c => c.campaign_id === a.campaign_id);
+  if (!camp) return out(400, { error: 'Esa campaña no existe' });
+  if (!prev && camp.estado === 'cancelada') return out(400, { error: 'Esa campaña está cancelada' });
+  if (!leerCsv('tiendas').some(s => s.store_id === a.store_id)) return out(400, { error: 'Esa tienda no existe' });
+  // La tarea no cambia de dueño: mover una evidencia de tienda o de campaña es reescribir el cumplimiento.
+  if (prev && (a.campaign_id !== prev.campaign_id || a.store_id !== prev.store_id)) return out(400, { error: 'La campaña y la tienda de una tarea no se cambian' });
+  if (!nombreOk(a.titulo)) return out(400, { error: 'Falta el título de la tarea' });
+  if (a.guia.length > 2000) return out(400, { error: 'La guía no puede pasar de 2000 caracteres' });
+  if (!diaOk(a.vence)) return out(400, { error: 'Fecha de vencimiento no válida (AAAA-MM-DD)' });
+  if (!EST_TAR.includes(a.estado)) return out(400, { error: 'Estado no válido: ' + EST_TAR.join(', ') });
+  if (prev ? !MOV_T[prev.estado]?.includes(a.estado) : a.estado !== 'pendiente')
+    return out(400, { error: prev ? `Una tarea ${prev.estado} no pasa a ${a.estado}` : 'Una tarea nace pendiente' });
+  if (a.evidencia) {
+    if (!EVID_RE.test(a.evidencia)) return out(400, { error: 'La evidencia tiene que ser una foto subida desde la app' });
+    if (a.evidencia.length > EVID_MAX) return out(400, { error: `Esa foto pesa ${(a.evidencia.length / 1e6).toFixed(1)} MB; el tope es 1,5 MB` });
+  }
+  if (['enviada', 'aprobada'].includes(a.estado) && !a.evidencia) return out(400, { error: 'No se envía ni se aprueba sin la foto de la evidencia' });
+  if (a.estado === 'rechazada' && a.nota.trim().length < 5) return out(400, { error: 'Devolver la tarea necesita decir qué hay que corregir' });
+  if (a.nota.length > 500) return out(400, { error: 'La nota no puede pasar de 500 caracteres' });
+  if (!nombreOk(a.quien)) return out(400, { error: 'Falta quién hace el cambio' });
+  a.actualizado = new Date().toISOString(); // la fecha la pone el servidor, no el navegador
+  if (prev) filas[i] = a; else filas.push(a);
+  escribirCsv('tareas_tienda', filas);
+  out(200, a);
+}
+
+// Borrar de verdad solo si nada cuelga de esa fila: el cliente ya lo avisa, el servidor lo garantiza.
+function puedeBorrar(t, id) {
+  if (t === 'espacios') {
+    const r = leerCsv('reservas').find(x => x.space_id === id && x.estado !== 'cancelada');
+    if (r) return `Ese espacio tiene una reserva ${r.estado} de ${r.anunciante}: cancélala o pausa el espacio`;
+  }
+  if (t === 'tiendas') {
+    if (leerCsv('tareas_tienda').some(x => x.store_id === id)) return 'Esa tienda tiene tareas: ciérrala en vez de borrarla';
+    if (leerCsv('comunicados_leidos').some(x => x.store_id === id)) return 'Esa tienda tiene confirmaciones de lectura: ciérrala en vez de borrarla';
+  }
+  if (t === 'reservas') {
+    const r = leerCsv('reservas').find(x => x.id === id);
+    if (r && r.estado === 'confirmada') return 'Una reserva confirmada no se borra: se cancela';
+    if (leerCsv('resultados').some(x => x.reserva_id === id)) return 'Esa reserva tiene resultados cargados: cancélala en vez de borrarla';
+  }
+  return '';
+}
+
 function api(req, res, t, u) {
   const out = (code, d) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(d)); };
   if (!Object.hasOwn(TABLAS, t)) return out(404, { error: 'Tabla desconocida' });
@@ -372,7 +528,13 @@ function api(req, res, t, u) {
   if (req.method === 'POST' && !String(req.headers['content-type']).startsWith('application/json')) return out(415, { error: 'Se espera JSON' });
   // Campañas, pedidos y su historial no se borran: el campaign_id y el rastro no se pierden.
   if (req.method === 'DELETE' && SIN_BORRAR.includes(t)) return out(405, { error: 'Esta tabla no se borra; usa su estado' });
-  if (req.method === 'DELETE') { const id = u.searchParams.get('id'); escribirCsv(t, leerCsv(t).filter(r => r[llave] !== id)); return out(200, { ok: true }); }
+  if (req.method === 'DELETE') {
+    const id = u.searchParams.get('id');
+    const no = puedeBorrar(t, id);
+    if (no) return out(409, { error: no });
+    escribirCsv(t, leerCsv(t).filter(r => r[llave] !== id));
+    return out(200, { ok: true });
+  }
   if (req.method === 'POST' && t === 'pedidos_historial') return out(405, { error: 'El historial se escribe junto con el pedido' });
   if (req.method === 'POST' && t === 'precios_historial') return out(405, { error: 'El historial se escribe junto con el cambio de precio' });
   if (req.method === 'POST' && t === 'publicaciones') return out(405, { error: 'Se escribe al publicar el feed' });
@@ -393,18 +555,16 @@ function api(req, res, t, u) {
         if (t === 'comunicados') return opComunicado(fila, out);
         if (t === 'comunicados_leidos') return opLeido(fila, out);
         if (t === 'marcas_estilo') return opEstiloMarca(fila, out);
+        if (t === 'espacios') return opEspacio(fila, out);
+        if (t === 'reservas') return opReserva(fila, out);
+        if (t === 'resultados') return opResultado(fila, out);
+        if (t === 'tiendas') return opTienda(fila, out);
+        if (t === 'tareas_tienda') return opTarea(fila, out);
         if (t === 'feeds') {
           const url = String(fila.url || '');
           if (!url.startsWith('archivo:') && !permitido(url)) return out(400, { error: 'Feed fuera de los dominios permitidos (PERMITIDOS en app/server.js)' });
           const ya = leerCsv('feeds').find(r => r.id === String(fila.id));
           fila.bajado = ya?.bajado || ''; fila.error = ya?.error || '';
-        }
-        // Reservas: un espacio no se confirma dos veces en las mismas fechas.
-        if (t === 'reservas') {
-          if (!esFecha(fila.inicio) || !esFecha(fila.fin) || !fila.inicio || fila.fin < fila.inicio) return out(400, { error: 'Fechas no válidas' });
-          const choca = fila.estado === 'confirmada' && leerCsv('reservas').find(r => r.id !== String(fila.id) && r.space_id === fila.space_id &&
-            r.estado === 'confirmada' && r.inicio <= fila.fin && fila.inicio <= r.fin);
-          if (choca) return out(409, { error: `Ese espacio ya está confirmado para ${choca.anunciante} del ${choca.inicio} al ${choca.fin}` });
         }
         const filas = leerCsv(t), i = filas.findIndex(r => r[llave] === String(fila[llave]));
         const limpia = Object.fromEntries(TABLAS[t].map(c => [c, fila[c] ?? (i >= 0 ? filas[i][c] : '')]));

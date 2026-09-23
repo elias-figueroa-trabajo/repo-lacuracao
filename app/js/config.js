@@ -1,7 +1,8 @@
 // Configuración de la app. Hoy todo corre en local (app/server.js).
 // Al pasar a Supabase, el proxy será una Edge Function y aquí cambia solo esta línea.
 const PROXY = '/proxy?url=';
-export const proxied = url => url.startsWith('data:') || url.startsWith('blob:') ? url : PROXY + encodeURIComponent(url);
+// Una URL del propio sitio (/demo/x.svg) no pasa por el proxy: el proxy solo acepta dominios de PERMITIDOS y la rechazaba con 403.
+export const proxied = url => url.startsWith('data:') || url.startsWith('blob:') || (url.startsWith('/') && !url.startsWith('//')) ? url : PROXY + encodeURIComponent(url);
 
 // Formatos de salida. `id` va en el nombre del archivo.
 export const FORMATOS = [

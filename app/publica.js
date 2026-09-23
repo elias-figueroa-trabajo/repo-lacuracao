@@ -26,7 +26,7 @@ const RAIZ = path.join(__dirname, '..');
 const RECETAS = path.join(RAIZ, 'auto', 'recetas');
 const PAGES = path.resolve(process.env.PAGES_DIR || path.join(RAIZ, 'docs'));
 const SLUG = /^[A-Za-z0-9][A-Za-z0-9_-]{2,79}\/[A-Za-z0-9][A-Za-z0-9_-]{2,79}$/;
-const ESPERA_MAX = 6 * 3600e3;  // red de seguridad: la página deja de dibujar antes (PLAZO_MIN)
+const ESPERA_MAX = 5 * 3600e3;  // red de seguridad: la página deja de dibujar antes (PLAZO_MIN)
 const GRACIA = 48 * 3600e3;     // una pieza retirada se borra del repo recién a las 48 h
 const CI = !!process.env.GITHUB_ACTIONS;
 let PUBLICA = ''; // raíz pública (la dice el servidor: PAGES_URL o el propio repo en Actions)
@@ -40,7 +40,7 @@ const PARTE = Number(opcion('--parte')) || 0;
 const DE = Math.max(1, Number(opcion('--de')) || 1);
 const LIMITE = Number(opcion('--limite')) || 0;
 const PUERTO = Number(opcion('--puerto')) || 5192;
-const PLAZO_MIN = Number(opcion('--plazo')) || 300;
+const PLAZO_MIN = Number(opcion('--plazo')) || 240; // el job de Actions muere a los 330 min: hay que cerrar antes
 
 const dormir = ms => new Promise(r => setTimeout(r, ms));
 const leerJson = (f, def) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return def; } };
