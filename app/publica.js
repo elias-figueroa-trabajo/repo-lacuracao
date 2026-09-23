@@ -17,6 +17,7 @@
 // La URL pública sale sola del repo en Actions (https://<dueño>.github.io/<repo>); en local se puede
 // forzar con la variable PAGES_URL.
 const { spawn, execFileSync } = require('child_process');
+const { escribirPaginas } = require('./pagina');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -28,6 +29,7 @@ const SLUG = /^[A-Za-z0-9][A-Za-z0-9_-]{2,79}\/[A-Za-z0-9][A-Za-z0-9_-]{2,79}$/;
 const ESPERA_MAX = 6 * 3600e3;  // red de seguridad: la página deja de dibujar antes (PLAZO_MIN)
 const GRACIA = 48 * 3600e3;     // una pieza retirada se borra del repo recién a las 48 h
 const CI = !!process.env.GITHUB_ACTIONS;
+let PUBLICA = ''; // raíz pública (la dice el servidor: PAGES_URL o el propio repo en Actions)
 
 const arg = process.argv.slice(2);
 const opcion = n => { const i = arg.indexOf(n); return i >= 0 ? arg[i + 1] : undefined; };
@@ -154,6 +156,7 @@ async function main() {
   try {
     const { ftp_url: _f, ...est } = await pedir('/publicar/estado');
     if (!est.pages_url) throw new Error('Falta PAGES_URL: la raíz pública del repo (en Actions sale sola del repo)');
+    PUBLICA = est.pages_url;
     decir(slug, 'Publica en ' + est.pages_url + '/' + slug + '/feed.csv');
     if (UNIR) r = await unir(slug);
     else {
@@ -169,6 +172,15 @@ async function main() {
   } finally { srv.kill(); }
 
   const paso = UNIR ? 'Unir' : DE > 1 ? `Parte ${PARTE} de ${DE}` : 'Corrida completa';
+  // Log de cambios en la propia URL del feed: historial.json + index.html + portada del repo.
+  // Solo lo escribe quien cierra la corrida (unir, o la corrida completa sin reparto).
+  if (UNIR || DE === 1) {
+    try {
+      const paginas = escribirPaginas(PAGES, slug, PUBLICA + '/' + slug + '/feed.csv', process.env.GITHUB_REPOSITORY || '',
+        { productos: r.productos, nuevas: r.nuevas, reusadas: r.reusadas, retiradas: r.retiradas, borradas: r.borradas, paso });
+      decir(slug, `Log de cambios al día (${paginas} corridas guardadas)`);
+    } catch (e) { decir(slug, 'No se pudo escribir el log de cambios: ' + e.message); }
+  }
   const resumen = ['| Feed | Paso | Productos | Nuevas | Reusadas | Retiradas | Borradas |', '|---|---|---|---|---|---|---|',
     `| ${slug} | ${paso} | ${r.productos ?? r.filas ?? '-'} | ${r.nuevas ?? '-'} | ${r.reusadas ?? '-'} | ${r.retiradas ?? '-'} | ${r.borradas ?? '-'} |`].join('\n');
   console.log('\n' + resumen);

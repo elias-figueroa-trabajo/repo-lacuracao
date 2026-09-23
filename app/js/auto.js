@@ -108,7 +108,7 @@ async function correr() {
   if (cortado) return;
 
   const filas = res.filter(Boolean).map(t => ({ ...t.fila, _img: t.archivo, _firma: t.firma, _pf: t.pf }));
-  if (!filas.length) throw new Error('Ningún producto quedó apto (revisa fotos, precio y link)');
+  if (!filas.length) throw new Error('Ningún producto quedó apto: ' + JSON.stringify(fuera) + ' (revisa fotos, precio y link)');
   await progreso(`Escribiendo el CSV: ${filas.length} productos, ${dibujadas} piezas nuevas`);
   const cuerpo = { filas, leidos: prods.length, fuera, atrasadas, dibujadas };
   // Repartido: cada parte deja sus filas y el CSV lo arma después el paso de unir (app/publica.js --unir).

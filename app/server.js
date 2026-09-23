@@ -32,9 +32,17 @@ const TABLAS = {
   reservas: ['id', 'space_id', 'campaign_id', 'anunciante', 'inicio', 'fin', 'estado', 'precio', 'pieza_url', 'destino', 'quien', 'creado'],
   resultados: ['id', 'reserva_id', 'semana', 'impresiones', 'clics', 'unidades', 'venta', 'fuente'],
   reportes: ['id', 'campaign_id', 'anunciante', 'recomendacion', 'quien', 'actualizado'],
+  // Marketing Studio · control de cambios de precio (riesgo regulatorio: el rastro no se borra)
+  precios: ['id', 'campaign_id', 'marca', 'sku', 'producto', 'precio_actual', 'precio_nuevo', 'desde', 'hasta', 'motivo', 'estado',
+    'solicitante', 'solicitado_en', 'aprobador', 'aprobado_en', 'retirado_por', 'retirado_en', 'retiro_motivo', 'creado', 'actualizado'],
+  precios_historial: ['id', 'precio_id', 'cuando', 'quien', 'accion', 'texto', 'antes', 'despues'],
+  // EFE Ads · aprobación de piezas de terceros
+  aprobaciones: ['id', 'campaign_id', 'marca', 'anunciante', 'space_id', 'pieza_url', 'destino', 'estado', 'checks', 'revisor', 'comentario', 'quien', 'creado', 'actualizado'],
   // MartechHub
   tiendas: ['store_id', 'nombre', 'marca', 'zona', 'ciudad', 'responsable', 'estado'],
   tareas_tienda: ['id', 'campaign_id', 'store_id', 'titulo', 'guia', 'vence', 'estado', 'evidencia', 'nota', 'quien', 'actualizado'],
+  comunicados: ['id', 'titulo', 'cuerpo', 'marca', 'zonas', 'prioridad', 'estado', 'vence', 'quien', 'creado', 'actualizado'],
+  comunicados_leidos: ['id', 'comunicado_id', 'store_id', 'quien', 'cuando'],
   // Feed saliente de la Fábrica (lo escribe publicar.js, no se hace POST directo)
   publicaciones: ['id', 'campaign_id', 'formato', 'productos', 'url_feed', 'destino', 'creado'],
 };
@@ -68,7 +76,7 @@ function escribirCsv(t, filas) {
   fs.writeFileSync(f + '.tmp', txt); fs.renameSync(f + '.tmp', f); // escritura atómica
 }
 
-const SIN_BORRAR = ['campanas', 'pedidos', 'pedidos_historial'];
+const SIN_BORRAR = ['campanas', 'pedidos', 'pedidos_historial', 'precios', 'precios_historial', 'comunicados_leidos'];
 
 // Campaña fija para jugar con las herramientas sin ensuciar las reales. Nace sola si falta.
 const PRUEBA = 'C9901_PRUEBA';
@@ -129,6 +137,31 @@ function opPedido(fila, out) {
   out(200, { ...p, _mov: h });
 }
 
+// ---------- Campañas: el campaign_id es una llave maestra, no se falsea ----------
+// Todo lo demás cuelga de este id (piezas, pedidos, links, reservas, reportes), así que
+// el formato y el estado se comprueban aquí y no solo en el navegador. Espejo de
+// CAMPAIGN_RE en app/js/config.js: si una cambia, la otra también.
+const CAMPAIGN_RE = /^C\d{2}(0[1-9]|1[0-2])_[A-Z0-9]+(_[A-Z0-9]+)?$/; // C + AAMM con mes real
+const ESTADOS_CAMP = ['borrador', 'aprobada', 'cancelada'];
+function opCampana(fila, out) {
+  const c = Object.fromEntries(TABLAS.campanas.map(k => [k, String(fila[k] ?? '').trim()]));
+  if (!CAMPAIGN_RE.test(c.campaign_id)) return out(400, { error: 'El campaign_id no tiene el formato C{AAMM}_{NOMBRE}[_{ANUNCIANTE}], con mes 01-12' });
+  if (!c.nombre || c.nombre.length > 120) return out(400, { error: 'La campaña necesita un nombre de hasta 120 caracteres' });
+  if (c.estado && !ESTADOS_CAMP.includes(c.estado)) return out(400, { error: 'Estado no válido: ' + ESTADOS_CAMP.join(', ') });
+  if (c.marca && !MARCAS.includes(c.marca)) return out(400, { error: 'Marca no válida: ' + MARCAS.join(', ') });
+  if (![c.inicio, c.fin, c.aprobado_en].every(esFecha)) return out(400, { error: 'Fecha no válida' });
+  if (c.inicio && c.fin && c.fin < c.inicio) return out(400, { error: 'La fecha de fin va antes que la de inicio' });
+  // Nada que Excel lea como fórmula al abrir el CSV del calendario.
+  for (const k of ['nombre', 'anunciante', 'dueno', 'aprobado_por']) if (/^[=+\-@\t\r]/.test(c[k])) return out(400, { error: `El campo ${k} no puede empezar por = + - @` });
+  const filas = leerCsv('campanas'), i = filas.findIndex(r => r.campaign_id === c.campaign_id);
+  const ahora = new Date().toISOString();
+  c.creado = i >= 0 ? (filas[i].creado || ahora) : ahora; // el id nace una sola vez
+  c.actualizado = ahora;
+  if (i >= 0) filas[i] = c; else filas.push(c);
+  escribirCsv('campanas', filas);
+  out(200, c);
+}
+
 // ---------- Links UTM: la campaña manda y la URL final es única ----------
 // Solo se crean o se borran (no se editan). Si la URL ya existe se devuelve la registrada,
 // así dos pestañas que generan el mismo link no lo duplican.
@@ -155,19 +188,166 @@ function opLink(fila, out) {
   out(200, l);
 }
 
+// ---------- Control de cambios de precio ----------
+// Un precio mal publicado se paga en margen o en multa (CLAUDE.md §3.3), así que aquí:
+// el que pide no aprueba, una caída fuerte necesita confirmación aparte, dos vigencias
+// aprobadas del mismo SKU no se cruzan, y cada movimiento queda en un historial que solo crece.
+const MARCAS = ['Tiendas EFE', 'La Curacao', 'Motocorp', 'Financiera Efectiva', 'Juntoz'];
+const MOV_P = {
+  creado: [[], ['pendiente']], editado: [['pendiente'], ['pendiente']],
+  aprobado: [['pendiente'], ['aprobado']], rechazado: [['pendiente'], ['rechazado']],
+  retirado: [['aprobado'], ['retirado']], // retiro de emergencia
+  nota: [['pendiente', 'aprobado', 'rechazado', 'retirado'], null],
+};
+const CAIDA_FUERTE = 40; // % de baja a partir del cual se pide confirmar aparte
+const centimos = s => /^\d{1,7}([.,]\d{1,2})?$/.test(String(s ?? '').trim()) ? Math.round(+String(s).trim().replace(',', '.') * 100) : null;
+const diaOk = s => /^\d{4}-\d{2}-\d{2}$/.test(s) && new Date(s + 'T00:00:00Z').toISOString().slice(0, 10) === s;
+const nombreOk = s => !!s && s.length <= 80 && !/^[=+\-@\t\r]/.test(s);
+
+function opPrecio(fila, out) {
+  const m = fila._mov || {}, mov = MOV_P[m.accion];
+  if (!mov) return out(400, { error: 'Acción desconocida' });
+  if (!nombreOk(String(m.quien || '').trim())) return out(400, { error: 'Falta quién lo hace' });
+  const quien = String(m.quien).trim();
+  const filas = leerCsv('precios'), i = filas.findIndex(r => r.id === String(fila.id)), prev = i >= 0 ? filas[i] : null;
+  if (!prev && m.accion !== 'creado') return out(404, { error: 'Ese cambio de precio no existe' });
+  if (prev && m.accion === 'creado') return out(409, { error: 'Ese cambio de precio ya existe' });
+  if (prev && String(fila._base || '') !== prev.actualizado) return out(409, { error: 'Otra persona cambió esta solicitud. Se cargó lo último: vuelve a hacer tu cambio.' });
+  const p = Object.fromEntries(TABLAS.precios.map(c => [c, String(fila[c] ?? (prev ? prev[c] : '')).trim()]));
+  if (prev && !mov[0].includes(prev.estado)) return out(409, { error: `No se puede «${m.accion}» un cambio ${prev.estado}` });
+  if (!(mov[1] || [prev.estado]).includes(p.estado)) return out(400, { error: 'Estado no válido para esa acción' });
+
+  if (!/^[A-Za-z0-9._-]{1,40}$/.test(p.sku)) return out(400, { error: 'SKU no válido' });
+  if (!p.producto) return out(400, { error: 'Falta el nombre del producto' });
+  if (!MARCAS.includes(p.marca)) return out(400, { error: 'Marca no válida' });
+  const cA = centimos(p.precio_actual), cN = centimos(p.precio_nuevo);
+  if (!cA || !cN) return out(400, { error: 'Los precios van en soles, mayores que cero (ej. 1299.90)' });
+  p.precio_actual = (cA / 100).toFixed(2); p.precio_nuevo = (cN / 100).toFixed(2);
+  if (!diaOk(p.desde)) return out(400, { error: 'La vigencia necesita fecha de inicio' });
+  if (p.hasta && (!diaOk(p.hasta) || p.hasta < p.desde)) return out(400, { error: 'La fecha de fin no puede ser anterior al inicio' });
+  if (p.motivo.trim().length < 5) return out(400, { error: 'Falta el motivo del cambio' });
+  if (!nombreOk(p.solicitante)) return out(400, { error: 'Falta el solicitante' });
+  // La campaña es opcional (un precio puede no venir de una campaña), pero si va, manda.
+  if (p.campaign_id) {
+    const camp = leerCsv('campanas').find(c => c.campaign_id === p.campaign_id);
+    if (!camp) return out(400, { error: 'Esa campaña no existe' });
+    if (camp.estado === 'cancelada' && (!prev || prev.campaign_id !== p.campaign_id)) return out(400, { error: 'Esa campaña está cancelada' });
+    if (camp.marca) p.marca = camp.marca;
+  }
+  // Doble confirmación: una caída fuerte no se guarda sin marcarla a propósito.
+  const baja = Math.round((cA - cN) / cA * 100);
+  if (['creado', 'editado'].includes(m.accion) && baja >= CAIDA_FUERTE && fila._confirmo !== true)
+    return out(409, { error: `Baja de ${baja}%: confirma que el precio nuevo es correcto antes de guardar`, confirmar: baja });
+  if (m.accion === 'aprobado') {
+    if (!nombreOk(p.aprobador)) return out(400, { error: 'Falta quién aprueba' });
+    if (p.aprobador.toLowerCase() !== quien.toLowerCase()) return out(400, { error: 'El aprobador tiene que ser quien está aprobando' });
+    if (p.aprobador.toLowerCase() === p.solicitante.toLowerCase()) return out(409, { error: 'El que pide el cambio no puede aprobarlo' });
+    const fin = a => a.hasta || '9999-12-31';
+    const choca = filas.find(r => r.id !== p.id && r.estado === 'aprobado' && r.sku === p.sku && r.marca === p.marca &&
+      r.desde <= fin(p) && p.desde <= fin(r));
+    if (choca) return out(409, { error: `Ese SKU ya tiene un precio aprobado del ${choca.desde} al ${choca.hasta || 'sin fin'}` });
+  }
+  if (m.accion === 'retirado' && String(m.texto || '').trim().length < 5) return out(400, { error: 'El retiro de emergencia necesita un motivo' });
+
+  const ahora = new Date().toISOString();
+  if (!prev) { p.creado = ahora; p.solicitado_en = ahora; }
+  if (m.accion === 'aprobado') p.aprobado_en = ahora;
+  if (m.accion === 'rechazado') { p.aprobador = quien; p.aprobado_en = ahora; }
+  if (m.accion === 'retirado') { p.retirado_por = quien; p.retirado_en = ahora; p.retiro_motivo = String(m.texto).trim(); }
+  p.actualizado = ahora;
+  const h = { id: 'hp_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), precio_id: p.id, cuando: ahora,
+    quien, accion: m.accion, texto: String(m.texto || '').trim(),
+    antes: prev ? `${prev.precio_actual}→${prev.precio_nuevo}` : '', despues: `${p.precio_actual}→${p.precio_nuevo}` };
+  if (prev) filas[i] = p; else filas.push(p);
+  const hs = leerCsv('precios_historial'); hs.push(h);
+  escribirCsv('precios', filas); escribirCsv('precios_historial', hs);
+  out(200, { ...p, _mov: h });
+}
+
+// ---------- Aprobación de piezas de terceros (EFE Ads) ----------
+const APR = ['pendiente', 'aprobada', 'cambios', 'rechazada'];
+const piezaOk = s => /^\/demo\/[a-z0-9_.-]+$/i.test(s) || urlLimpia(s);
+function opAprob(fila, out) {
+  const filas = leerCsv('aprobaciones'), i = filas.findIndex(r => r.id === String(fila.id)), prev = i >= 0 ? filas[i] : null;
+  const a = Object.fromEntries(TABLAS.aprobaciones.map(c => [c, String(fila[c] ?? (prev ? prev[c] : '')).trim()]));
+  if (prev && String(fila._base || '') !== prev.actualizado) return out(409, { error: 'Otra persona cambió esta revisión. Se cargó lo último: vuelve a hacer tu cambio.' });
+  const camp = leerCsv('campanas').find(c => c.campaign_id === a.campaign_id);
+  if (!camp) return out(400, { error: 'Esa campaña no existe' });
+  if (camp.estado === 'cancelada' && (!prev || prev.campaign_id !== a.campaign_id)) return out(400, { error: 'Esa campaña está cancelada' });
+  a.marca = camp.marca || a.marca;
+  if (!a.anunciante) return out(400, { error: 'Falta el anunciante' });
+  if (a.space_id && !leerCsv('espacios').some(e => e.space_id === a.space_id)) return out(400, { error: 'Ese espacio no existe' });
+  if (!piezaOk(a.pieza_url)) return out(400, { error: 'La pieza tiene que ser una URL http(s) sin usuario ni clave' });
+  if (a.destino && !urlLimpia(a.destino)) return out(400, { error: 'El destino tiene que ser http(s) sin usuario ni clave' });
+  if (!APR.includes(a.estado)) return out(400, { error: 'Estado no válido' });
+  if (a.estado !== 'pendiente' && !nombreOk(a.revisor)) return out(400, { error: 'Falta el revisor' });
+  if (['rechazada', 'cambios'].includes(a.estado) && a.comentario.trim().length < 5) return out(400, { error: 'Rechazar o pedir cambios necesita un comentario' });
+  if (a.estado === 'aprobada' && a.checks.split('|').filter(Boolean).length < 4) return out(409, { error: 'Marca los 4 puntos de la revisión antes de aprobar' });
+  if (!nombreOk(a.quien)) return out(400, { error: 'Falta quién la subió' });
+  const ahora = new Date().toISOString();
+  if (!prev) a.creado = ahora;
+  a.actualizado = ahora;
+  if (prev) filas[i] = a; else filas.push(a);
+  escribirCsv('aprobaciones', filas);
+  out(200, a);
+}
+
+// ---------- Comunicados (MartechHub) ----------
+function opComunicado(fila, out) {
+  const filas = leerCsv('comunicados'), i = filas.findIndex(r => r.id === String(fila.id)), prev = i >= 0 ? filas[i] : null;
+  const c = Object.fromEntries(TABLAS.comunicados.map(k => [k, String(fila[k] ?? (prev ? prev[k] : '')).trim()]));
+  if (prev && String(fila._base || '') !== prev.actualizado) return out(409, { error: 'Otra persona cambió este comunicado. Se cargó lo último: vuelve a hacer tu cambio.' });
+  if (c.titulo.length < 3 || c.titulo.length > 120) return out(400, { error: 'El título va entre 3 y 120 caracteres' });
+  if (c.cuerpo.trim().length < 10) return out(400, { error: 'Falta el texto del comunicado' });
+  if (c.marca && !MARCAS.includes(c.marca)) return out(400, { error: 'Marca no válida' });
+  if (!['normal', 'urgente'].includes(c.prioridad)) return out(400, { error: 'Prioridad no válida' });
+  if (!['publicado', 'archivado'].includes(c.estado)) return out(400, { error: 'Estado no válido' });
+  if (c.vence && !diaOk(c.vence)) return out(400, { error: 'Fecha de vigencia no válida' });
+  if (!nombreOk(c.quien)) return out(400, { error: 'Falta quién publica' });
+  const zonas = leerCsv('tiendas').map(t => t.zona);
+  const malas = c.zonas.split('|').filter(Boolean).filter(z => !zonas.includes(z));
+  if (malas.length) return out(400, { error: 'Zona desconocida: ' + malas[0] });
+  const ahora = new Date().toISOString();
+  if (!prev) c.creado = ahora;
+  c.actualizado = ahora;
+  if (prev) filas[i] = c; else filas.push(c);
+  escribirCsv('comunicados', filas);
+  out(200, c);
+}
+
+// Confirmación de lectura: una por tienda y comunicado, y no se edita ni se borra.
+function opLeido(fila, out) {
+  const l = Object.fromEntries(TABLAS.comunicados_leidos.map(k => [k, String(fila[k] ?? '').trim()]));
+  const com = leerCsv('comunicados').find(c => c.id === l.comunicado_id);
+  if (!com) return out(400, { error: 'Ese comunicado no existe' });
+  if (com.estado !== 'publicado') return out(400, { error: 'Ese comunicado ya no está publicado' });
+  if (!leerCsv('tiendas').some(t => t.store_id === l.store_id)) return out(400, { error: 'Esa tienda no existe' });
+  if (!nombreOk(l.quien)) return out(400, { error: 'Falta quién confirma' });
+  const filas = leerCsv('comunicados_leidos');
+  const ya = filas.find(r => r.comunicado_id === l.comunicado_id && r.store_id === l.store_id);
+  if (ya) return out(200, ya);
+  l.cuando = new Date().toISOString();
+  filas.push(l); escribirCsv('comunicados_leidos', filas);
+  out(200, l);
+}
+
 function api(req, res, t, u) {
   const out = (code, d) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(d)); };
   if (!Object.hasOwn(TABLAS, t)) return out(404, { error: 'Tabla desconocida' });
   const llave = TABLAS[t][0];
   if (req.method === 'GET') return out(200, leerCsv(t));
   // Escrituras solo desde la propia página: bloquea que otra web escriba en el servidor local.
+  // Se exige la cabecera, no solo que cuadre: misma regla que ctxLocal() para /publicar y /lote.
+  // Quien escribe siempre es el navegador (los runners de auto.js y lote.js solo leen), así que
+  // una petición sin Origin no viene de la app.
   const origen = req.headers.origin;
-  if (origen && origen !== 'http://localhost:' + PORT && origen !== 'http://127.0.0.1:' + PORT) return out(403, { error: 'Origen no permitido' });
+  if (origen !== 'http://localhost:' + PORT && origen !== 'http://127.0.0.1:' + PORT) return out(403, { error: 'Origen no permitido' });
   if (req.method === 'POST' && !String(req.headers['content-type']).startsWith('application/json')) return out(415, { error: 'Se espera JSON' });
   // Campañas, pedidos y su historial no se borran: el campaign_id y el rastro no se pierden.
   if (req.method === 'DELETE' && SIN_BORRAR.includes(t)) return out(405, { error: 'Esta tabla no se borra; usa su estado' });
   if (req.method === 'DELETE') { const id = u.searchParams.get('id'); escribirCsv(t, leerCsv(t).filter(r => r[llave] !== id)); return out(200, { ok: true }); }
   if (req.method === 'POST' && t === 'pedidos_historial') return out(405, { error: 'El historial se escribe junto con el pedido' });
+  if (req.method === 'POST' && t === 'precios_historial') return out(405, { error: 'El historial se escribe junto con el cambio de precio' });
   if (req.method === 'POST' && t === 'publicaciones') return out(405, { error: 'Se escribe al publicar el feed' });
   if (req.method === 'POST') {
     let body = '';
@@ -178,8 +358,13 @@ function api(req, res, t, u) {
         const fila = JSON.parse(body);
         if (!fila || typeof fila !== 'object' || Array.isArray(fila)) return out(400, { error: 'Se espera un objeto' });
         if (!fila[llave]) return out(400, { error: 'Falta ' + llave });
+        if (t === 'campanas') return opCampana(fila, out);
         if (t === 'pedidos') return opPedido(fila, out);
         if (t === 'links') return opLink(fila, out);
+        if (t === 'precios') return opPrecio(fila, out);
+        if (t === 'aprobaciones') return opAprob(fila, out);
+        if (t === 'comunicados') return opComunicado(fila, out);
+        if (t === 'comunicados_leidos') return opLeido(fila, out);
         if (t === 'feeds') {
           const url = String(fila.url || '');
           if (!url.startsWith('archivo:') && !permitido(url)) return out(400, { error: 'Feed fuera de los dominios permitidos (PERMITIDOS en app/server.js)' });
