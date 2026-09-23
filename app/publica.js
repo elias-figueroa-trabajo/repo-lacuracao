@@ -35,6 +35,7 @@ const arg = process.argv.slice(2);
 const opcion = n => { const i = arg.indexOf(n); return i >= 0 ? arg[i + 1] : undefined; };
 const CON_VALOR = ['--parte', '--de', '--limite', '--puerto', '--plazo'];
 const UNIR = arg.includes('--unir');
+const REPARTIDO = arg.includes('--parte'); // aunque sea --de 1: unir siempre escribe el CSV
 const PARTE = Number(opcion('--parte')) || 0;
 const DE = Math.max(1, Number(opcion('--de')) || 1);
 const LIMITE = Number(opcion('--limite')) || 0;
@@ -95,7 +96,7 @@ async function dibujar(slug, chrome) {
   const perfil = fs.mkdtempSync(path.join(os.tmpdir(), 'efe-pages-'));
   const url = `http://127.0.0.1:${PUERTO}/auto.html?slug=${encodeURIComponent(slug)}`
     + `&plazo=${Date.now() + PLAZO_MIN * 60e3}${LIMITE ? '&limite=' + LIMITE : ''}`
-    + (DE > 1 ? `&parte=${PARTE}&de=${DE}` : '');
+    + (REPARTIDO ? `&parte=${PARTE}&de=${DE}` : '');
   const flags = ['--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check', '--disable-extensions',
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows',
     '--user-data-dir=' + perfil];
@@ -167,7 +168,7 @@ async function main() {
       if (!r.ok) throw new Error(r.error);
       decir(slug, `Dibujo listo en ${Math.round((Date.now() - t0) / 60e3)} min: ${JSON.stringify(r)}`);
       // Sin reparto, auto-feed ya dejó el CSV: falta cerrar el estado y podar, igual que al unir.
-      if (DE === 1) r = { ...r, ...cerrarEstado(slug) };
+      if (!REPARTIDO) r = { ...r, ...cerrarEstado(slug) };
     }
   } finally { srv.kill(); }
 

@@ -17,6 +17,11 @@ name: Feeds a Pages
 on:
   schedule:
     - cron: '0 * * * *'
+  # «Actualizar ahora» desde el panel «Mis feeds»: el servidor local escribe auto/ahora.json con el
+  # feed pedido y empuja. Ese empujón dispara esta corrida al instante, sin secretos ni token.
+  push:
+    paths:
+      - 'auto/ahora.json'
   workflow_dispatch:
     inputs:
       slug:
@@ -47,11 +52,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: auto/recetas
+          sparse-checkout: auto
       - id: l
         env:
           SLUG_MANUAL: ${{ github.event.inputs.slug }}
           PARTES_MANUAL: ${{ github.event.inputs.partes }}
+          EVENTO: ${{ github.event_name }}
         run: |
           export HORA=$(TZ=America/Lima date +%H:00)
           echo "Hora de Lima: $HORA"
@@ -59,6 +65,17 @@ jobs:
             const fs = require("fs"), path = require("path");
             const hora = process.env.HORA, manual = (process.env.SLUG_MANUAL || "").trim();
             const pManual = Number(process.env.PARTES_MANUAL) || 0;
+            // «Actualizar ahora»: auto/ahora.json trae los feeds pedidos desde el panel. Se atiende solo
+            // si el pedido es de hace menos de 6 h, para que un revert viejo no relance nada.
+            let ahora = null;
+            if (process.env.EVENTO === "push") {
+              try {
+                const p = JSON.parse(fs.readFileSync("auto/ahora.json", "utf8"));
+                const t = Date.parse(p.pedido);
+                if (Array.isArray(p.slugs) && p.slugs.length && t && Date.now() - t < 6 * 3600e3) ahora = new Set(p.slugs);
+              } catch { /* sin pedido: no corre nada */ }
+              if (!ahora) console.log("El empujón no trae ningún pedido vigente en auto/ahora.json");
+            }
             const raiz = "auto/recetas", feeds = [], matriz = [];
             for (const t of fs.existsSync(raiz) ? fs.readdirSync(raiz, { withFileTypes: true }) : []) {
               if (!t.isDirectory()) continue;
@@ -67,6 +84,7 @@ jobs:
                 const slug = t.name + "/" + f.slice(0, -5);
                 let r; try { r = JSON.parse(fs.readFileSync(path.join(raiz, t.name, f), "utf8")); } catch { continue; }
                 if (manual) { if (slug !== manual) continue; }
+                else if (process.env.EVENTO === "push") { if (!ahora || !ahora.has(slug)) continue; }
                 else {
                   if (r.activo === false) continue;
                   const horas = Array.isArray(r.horas) && r.horas.length ? r.horas : ["07:00", "15:00"];
@@ -116,10 +134,13 @@ jobs:
           LIM=$(printf '%s' "$LIMITE" | tr -cd '0-9')
           node app/publica.js "${{ matrix.tarea.slug }}" --parte ${{ matrix.tarea.parte }} --de ${{ matrix.tarea.de }} ${LIM:+--limite $LIM}
       - name: Guardar lo dibujado para el paso de unir
+        # OJO con README.md: upload-artifact recorta la carpeta común de lo que sube. Sin un archivo
+        # de la raíz, docs/<tienda>/<nombre>/ se pierde y al bajarlo las partes caen fuera de docs/.
         uses: actions/upload-artifact@v4
         with:
           name: parte-${{ strategy.job-index }}
           path: |
+            README.md
             docs/*/*/img
             docs/*/*/partes
           if-no-files-found: error

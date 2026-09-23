@@ -12,6 +12,8 @@ const limite = Number(params.get('limite')) || 0; // solo para pruebas: corta el
 // Por número de orden y no por bloques, así todas las partes tardan parecido aunque el feed
 // venga ordenado por categoría. Sin estos parámetros, 0 de 1 = el catálogo entero, como siempre.
 const parte = Number(params.get('parte')) || 0, de = Math.max(1, Number(params.get('de')) || 1);
+// Con reparto, aunque sea de una sola parte, las filas van a `partes/` y el CSV lo escribe el paso de unir.
+const repartido = params.has('parte');
 // Hora tope para dibujar (la pone auto.js): lo que no alcance se dibuja en la próxima corrida.
 const plazo = Number(params.get('plazo')) || Infinity;
 const q = '?slug=' + encodeURIComponent(slug);
@@ -112,7 +114,7 @@ async function correr() {
   await progreso(`Escribiendo el CSV: ${filas.length} productos, ${dibujadas} piezas nuevas`);
   const cuerpo = { filas, leidos: prods.length, fuera, atrasadas, dibujadas };
   // Repartido: cada parte deja sus filas y el CSV lo arma después el paso de unir (app/publica.js --unir).
-  const ruta = de > 1 ? `/publicar/auto-parte${q}&parte=${parte}` : '/publicar/auto-feed' + q;
+  const ruta = repartido ? `/publicar/auto-parte${q}&parte=${parte}` : '/publicar/auto-feed' + q;
   const r = await pedir(ruta, json(cuerpo));
   log('LISTO ' + JSON.stringify(r));
 }

@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { sincronizar, estadoRepos } = require('./sincronizar');
 
 const PUB = path.join(__dirname, '..', 'publicado');
 const ENV = process.env.PUBLICAR_ENV || path.join(__dirname, '..', 'publicar.env'); // la variable solo sirve para pruebas
@@ -133,6 +134,9 @@ const RECETAS = path.join(__dirname, '..', 'auto', 'recetas');
 // Así lo que dibuja el navegador cae ya en su sitio definitivo y el workflow solo tiene que hacer commit.
 const AUTO = process.env.PAGES_DIR ? path.resolve(process.env.PAGES_DIR) : path.join(PUB, '_auto');
 const dirAuto = slug => path.join(AUTO, slug);
+// Donde vive de verdad lo publicado por Pages: dentro del repo de esa tienda, en docs/ (lo que sube el
+// workflow y lo que escribe app/publica.js). Antes solo se miraba publicado/_auto/, que es del camino FTP.
+const dirPages = slug => path.join(__dirname, '..', 'repo-' + slug.split('/')[0], 'docs', slug);
 const CAMP = /^C\d{2}(0[1-9]|1[0-2])_[A-Z0-9]+(_[A-Z0-9]+)?$/; // igual que CAMPAIGN_RE de config.js
 const FIRMA = /^[0-9a-f]{64}$/;
 const CAIDA = 0.5; // si salen menos de la mitad de productos que la última vez, no se publica (feed roto)
@@ -172,33 +176,41 @@ function generando(slug) {
 }
 
 // Info de una receta + su último estado, para el panel «Mis feeds».
-function infoReceta(slug, c) {
+function infoReceta(slug, c, repos) {
   const receta = leerJson(path.join(RECETAS, slug + '.json'), null);
   if (!receta) return null;
   const [tienda, nombre] = slug.split('/');
-  const estado = leerJson(path.join(dirAuto(slug), 'estado.json'), null);
+  // El estado que vale es el del repo (Pages); publicado/_auto/ queda para el camino viejo por FTP.
+  const estado = leerJson(path.join(dirPages(slug), 'estado.json'), null) || leerJson(path.join(dirAuto(slug), 'estado.json'), null);
   const manual = leerJson(path.join(dirAuto(slug), 'manual.json'), null);
+  // La URL pública sale del repo conectado; si no hay repo, de PAGES_URL/FTP_URL de publicar.env.
+  const raiz = (repos && repos[tienda] && repos[tienda].pages_url) || c.raiz;
   return {
     slug, tienda, nombre, campaign_id: receta.campaign_id || '', formato: receta.formato || '', plantilla_nombre: receta.plantilla?.nombre || '',
     activo: receta.activo !== false, horas: Array.isArray(receta.horas) && receta.horas.length ? receta.horas : HORAS_DEF,
     guardada: receta.guardada || '', productos: estado ? Object.keys(estado.productos || {}).length : 0,
     partes: Math.min(20, Math.max(1, Number(receta.partes) || PARTES_DEF)),
     actualizado: (estado && estado.actualizado) || '', generando: generando(slug),
-    ultimo_manual: manual || null, url_publica: c.raiz ? c.raiz + '/' + slug + '/feed.csv' : '',
+    ultimo_manual: manual || null, url_publica: raiz ? raiz + '/' + slug + '/feed.csv' : '',
   };
 }
 
-// «Generar ahora»: corre auto.js como proceso aparte (dibuja en Chrome sin pantalla y sube por FTP).
-// Solo sirve corriendo en la máquina de Elias (necesita Chrome y publicar.env); en Actions no se usa.
-function generarAhora(slug) {
+// «Generar en esta PC»: corre publica.js como proceso aparte (dibuja en Chrome sin pantalla y deja las
+// piezas y el CSV dentro de repo-<tienda>/docs/, listos para que el mismo botón de sincronizar los suba).
+// Es el camino de emergencia: lo normal es «Actualizar ahora», que lo dibuja GitHub en 10-15 min.
+// Solo sirve en la máquina de Elias (necesita Chrome); en Actions no se usa.
+function generarAhora(slug, pagesUrl) {
   const d = dirAuto(slug);
   fs.mkdirSync(d, { recursive: true });
   const lock = path.join(d, 'generando.lock');
   try { fs.writeFileSync(lock, '0 ' + Date.now(), { flag: 'wx' }); } catch { return false; } // ya hay otra corriendo
   const logF = fs.openSync(path.join(d, 'manual.log'), 'w');
   const puerto = 5195 + Math.floor(Math.random() * 100);
-  const hijo = spawn(process.execPath, [path.join(__dirname, 'auto.js'), slug, '--puerto', String(puerto)],
-    { cwd: path.join(__dirname, '..'), stdio: ['ignore', logF, logF], windowsHide: true, detached: true });
+  const pages = path.join(__dirname, '..', 'repo-' + slug.split('/')[0], 'docs');
+  fs.mkdirSync(pages, { recursive: true });
+  const hijo = spawn(process.execPath, [path.join(__dirname, 'publica.js'), slug, '--puerto', String(puerto)],
+    { cwd: path.join(__dirname, '..'), stdio: ['ignore', logF, logF], windowsHide: true, detached: true,
+      env: { ...process.env, PAGES_DIR: pages, ...(pagesUrl ? { PAGES_URL: pagesUrl } : {}) } });
   fs.writeFileSync(lock, hijo.pid + ' ' + Date.now());
   hijo.unref();
   hijo.on('error', () => { fs.closeSync(logF); fs.rmSync(lock, { force: true }); });
@@ -284,11 +296,14 @@ async function auto(req, u, accion, slug, ctx, c) {
     fs.rmSync(path.join(RECETAS, slug + '.json'), { force: true });
     return out(200, { ok: true });
   }
-  if (accion === 'generar') { // generar ahora, en esta máquina (necesita Chrome y FTP_* en publicar.env)
+  if (accion === 'generar') { // dibujar aquí mismo (necesita Chrome); deja todo en repo-<tienda>/docs/
     const receta = leerJson(path.join(RECETAS, slug + '.json'), null);
     if (!receta) return out(404, { error: 'No hay receta ' + slug });
     if (generando(slug)) return out(409, { error: 'Ya se está generando' });
-    if (!generarAhora(slug)) return out(409, { error: 'Ya se está generando' });
+    let pages = c.pagesUrl;
+    try { pages = estadoRepos([slug.split('/')[0]])[slug.split('/')[0]].pages_url || pages; } catch { /* sin repo: queda PAGES_URL */ }
+    if (!pages) return out(409, { error: 'No se sabe la dirección pública: conecta el repo de la tienda con SUBIR-REPO.bat (o pon PAGES_URL en publicar.env)' });
+    if (!generarAhora(slug, pages)) return out(409, { error: 'Ya se está generando' });
     return out(200, { ok: true });
   }
   if (accion === 'progreso') { console.log(`[${slug}] ${(await ctx.cuerpo(2000)).toString('utf8').slice(0, 300)}`); return out(200, { ok: true }); }
@@ -384,7 +399,11 @@ async function publicar(req, res, u, ctx) {
   const { out } = ctx, c = config(), accion = u.pathname.slice('/publicar/'.length);
   if (req.method === 'GET' && accion === 'estado') {
     const feeds = fs.readdirSync(PUB).filter(s => SLUG.test(s) && fs.existsSync(path.join(dir(s), 'filas.json'))).map(s => resumen(s, c, ctx.local));
-    return out(200, { github: listo(c), repo: c.repo, rama: c.rama, base: c.base, feeds, recetas: recetas().map(s => infoReceta(s, c)).filter(Boolean), ftp_url: c.ftpUrl, pages_url: c.pagesUrl });
+    const rs = recetas();
+    // Un repo por tienda: el panel necesita saber cuáles ya están conectados para ofrecer «Actualizar ahora».
+    let repos = {};
+    try { repos = estadoRepos([...new Set(rs.map(s => s.split('/')[0]))]); } catch { /* sin git instalado */ }
+    return out(200, { github: listo(c), repo: c.repo, rama: c.rama, base: c.base, feeds, recetas: rs.map(s => infoReceta(s, c, repos)).filter(Boolean), ftp_url: c.ftpUrl, pages_url: c.pagesUrl, repos });
   }
   if (req.method === 'GET' && accion === 'receta') {
     const slug = u.searchParams.get('slug') || '';
@@ -393,6 +412,19 @@ async function publicar(req, res, u, ctx) {
     return out(200, { receta, estado: { ...vacio(), ...leerJson(path.join(dirAuto(slug), 'estado.json'), {}) } });
   }
   if (req.method !== 'POST') return out(405, { error: 'Método no permitido' });
+  // Subir a GitHub lo que hay ahora (código + recetas) y, si se pide, disparar una corrida ya mismo.
+  // Es el mismo trabajo de SUBIR-REPO.bat, hecho desde el panel «Mis feeds».
+  if (accion === 'sincronizar') {
+    const b = JSON.parse((await ctx.cuerpo(4000)).toString('utf8') || '{}');
+    const tienda = String(b.tienda || '');
+    if (!TIENDA.test(tienda)) return out(400, { error: 'Tienda no válida' });
+    const pedidos = Array.isArray(b.slugs) ? b.slugs.filter(x => typeof x === 'string' && RUTA.test(x) && x.startsWith(tienda + '/')) : [];
+    // Solo se pide correr lo que existe como receta: así un slug inventado no viaja al repo.
+    const hay = new Set(recetas());
+    if (pedidos.some(x => !hay.has(x))) return out(404, { error: 'Ese feed no existe' });
+    try { return out(200, sincronizar(tienda, pedidos)); }
+    catch (e) { return out(409, { error: e.message }); }
+  }
   const ACCIONES_AUTO = ['receta', 'progreso', 'auto-fin', 'auto-img', 'auto-feed', 'auto-parte', 'auto-unir', 'activo', 'horas', 'partes', 'borrar', 'generar'];
   const slug = u.searchParams.get('slug') || '';
   if (ACCIONES_AUTO.includes(accion)) {
