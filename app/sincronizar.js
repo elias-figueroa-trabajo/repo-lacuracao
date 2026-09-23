@@ -89,12 +89,17 @@ function sincronizar(tienda, slugs) {
   // blobs (`--filter=blob:none`, GitHub lo soporta), se planta HEAD sobre `origin/<rama>`
   // dejando el índice como está allá, y se agrega solo lo nuestro **excluyendo `docs`**.
   // De ese modo `docs/` del remoto se conserva intacto y el push deja de salir «fetch first».
+  // Ojo: en un repo recien creado no hay `origin/<rama>` todavia, y entonces NO se puede excluir
+  // `docs`: el `docs/.nojekyll` que hace falta para que Pages sirva la carpeta se quedaria fuera
+  // del primer commit (le paso a repo-efe). Solo se excluye cuando alla ya hay algo que conservar.
   const rama0 = git(d, ['rev-parse', '--abbrev-ref', 'HEAD'], true).salida || 'main';
   const traido = git(d, ['fetch', '--filter=blob:none', 'origin', rama0], true);
-  if (traido.ok && git(d, ['rev-parse', '--verify', 'origin/' + rama0], true).ok) {
-    git(d, ['reset', '--mixed', 'origin/' + rama0], true);
-  }
-  git(d, ['add', '-A', '--', '.', ':(exclude)docs']);
+  const hayRemoto = traido.ok && git(d, ['rev-parse', '--verify', 'origin/' + rama0], true).ok;
+  if (hayRemoto) git(d, ['reset', '--mixed', 'origin/' + rama0], true);
+  git(d, hayRemoto ? ['add', '-A', '--', '.', ':(exclude)docs'] : ['add', '-A']);
+  // `docs/.nojekyll` es la unica cosa de `docs/` que manda esta maquina: sin el, Pages ignora
+  // las carpetas que empiezan con `_` y no sirve nada. Se agrega aparte de la exclusion.
+  if (fs.existsSync(path.join(d, 'docs', '.nojekyll'))) git(d, ['add', '-f', '--', 'docs/.nojekyll'], true);
   const hay = git(d, ['diff', '--cached', '--quiet'], true); // sale con error = sí hay cambios
   let commit = '';
   if (!hay.ok) {

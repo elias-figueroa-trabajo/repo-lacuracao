@@ -182,5 +182,14 @@ jobs:
           git add -A docs
           git diff --cached --quiet && { echo "Nada cambió"; exit 0; }
           git commit -m "Feeds a Pages: $(TZ=America/Lima date '+%Y-%m-%d %H:%M') (Lima)"
-          git pull --rebase origin "${GITHUB_REF_NAME}" || true
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          # Empujar 15 mil fotos tarda un minuto, y en ese minuto la Fabrica puede haber empujado
+          # una receta: GitHub rechaza con «cannot lock ref ... is at X but expected Y» y se perdia
+          # la corrida entera. Se reintenta: traer, reponer nuestro commit encima y volver a empujar.
+          for intento in 1 2 3 4 5; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then exit 0; fi
+            echo "Push rechazado (intento $intento); me reengancho a lo que hay en GitHub"
+            sleep $((intento * 10))
+            git fetch origin "${GITHUB_REF_NAME}"
+            git rebase "origin/${GITHUB_REF_NAME}" || { git rebase --abort || true; git reset --hard "origin/${GITHUB_REF_NAME}"; exit 1; }
+          done
+          echo "No se pudo empujar despues de 5 intentos"; exit 1
