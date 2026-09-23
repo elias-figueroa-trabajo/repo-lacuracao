@@ -2,7 +2,6 @@
 // Las posiciones van en fracciones del lienzo (0 a 1) por formato, así una misma plantilla
 // sirve para 1:1, 4:5, 9:16 y banner, y cada formato se puede acomodar por separado.
 import { proxied } from './config.js';
-import { fmtPrecio } from './feeds.js';
 
 export const NOMBRES = { foto: 'Foto del producto', logo: 'Logo', sello: 'Sello', marca: 'Marca', titulo: 'Título', precio: 'Precio', texto: 'Texto libre' };
 
@@ -18,11 +17,16 @@ export function plantillaBase() {
     capas: {
       foto: { vis: true, tarjeta: true, cTarjeta: '#ffffff' },
       logo: { vis: true, src: '' },
-      sello: { vis: true, texto: 'OFERTA', bg: '#ffd400', color: '#1a1a1a' },
-      marca: { vis: true, color: '#ffd9de', bold: false, align: 'left', mayus: true },
-      titulo: { vis: true, color: '#ffffff', bold: true, align: 'left' },
-      precio: { vis: true, color: '#ffffff', bg: '', align: 'left' },
-      texto: { vis: false, texto: 'Solo por hoy', color: '#ffffff', bold: false, align: 'left' },
+      sello: { vis: false, texto: 'OFERTA', bg: '#ffd400', color: '#1a1a1a', fuente: '' },
+      marca: { vis: true, color: '#ffd9de', bold: false, align: 'left', mayus: true, fuente: '' },
+      titulo: { vis: true, color: '#ffffff', bold: true, align: 'left', fuente: '' },
+      // El precio se escribe: [pre]1'299.90[post]. `dec` = cuantos decimales ('auto' = solo si los tiene),
+      // `miles` = que separa los miles (coma, punto, apostrofo, espacio o nada; el decimal sale de ahi).
+      // `antes` = el precio tachado: 'auto' solo si el feed trae sale_price. `dto` agrega el -%.
+      precio: { vis: true, color: '#ffffff', bg: '', align: 'left', fuente: '',
+        pre: null, post: '', dec: 'auto', miles: ',',
+        antes: 'auto', antesPre: 'Antes ', antesPost: '', antesTachado: true, antesColor: '', dto: false },
+      texto: { vis: false, texto: 'Solo por hoy', color: '#ffffff', bold: false, align: 'left', fuente: '' },
     },
     pos: {
       '1x1': { logo: [.06, .05, .3, .09], sello: [.66, .05, .28, .08], foto: [.08, .17, .84, .5], marca: [.08, .7, .84, .04], titulo: [.08, .745, .84, .11], precio: [.08, .865, .6, .1], texto: [.66, .88, .28, .06] },
@@ -99,6 +103,38 @@ function rrect(ctx, x, y, w, h, r) {
   ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
 }
 const FUENTE = '"Segoe UI", "Helvetica Neue", Arial, sans-serif';
+// Fuentes elegibles por capa. Solo familias que ya estan en Windows y en el runner de Actions
+// (fonts-liberation): una fuente que no exista en la maquina que dibuja saldria distinta en el lote.
+export const FUENTES = [
+  ['', 'La del sistema'],
+  ['Arial, Helvetica, sans-serif', 'Arial'],
+  ['"Arial Black", Arial, sans-serif', 'Arial Black'],
+  ['Verdana, Geneva, sans-serif', 'Verdana'],
+  ['Tahoma, Verdana, sans-serif', 'Tahoma'],
+  ['"Trebuchet MS", Arial, sans-serif', 'Trebuchet MS'],
+  ['Impact, "Arial Black", sans-serif', 'Impact'],
+  ['Georgia, "Times New Roman", serif', 'Georgia'],
+  ['"Times New Roman", Times, serif', 'Times New Roman'],
+  ['"Courier New", Courier, monospace', 'Courier New'],
+];
+const fam = c => c?.fuente || FUENTE;
+
+// ---------- precio ----------
+// Como se escribe un numero: decimales y separador de miles a eleccion (el decimal es el otro signo).
+export function fmtNum(v, c = {}) {
+  const miles = c.miles == null ? ',' : c.miles;
+  const d = String(c.dec) === '0' ? 0 : String(c.dec) === '2' ? 2 : (Math.abs(v % 1) > 1e-9 ? 2 : 0);
+  const [ent, fr] = Math.abs(v).toFixed(d).split('.');
+  const sep = miles === '.' ? ',' : '.';
+  return (v < 0 ? '-' : '') + ent.replace(/\B(?=(\d{3})+(?!\d))/g, miles) + (fr ? sep + fr : '');
+}
+// `pre` en null = el simbolo que trae el feed (S/ para PEN). Con texto propio, manda el texto.
+export function precioTxt(p, c = {}, demo = 0) {
+  const v = p ? p.v : demo, cur = p ? p.cur : 'PEN';
+  const pre = c.pre == null ? (cur === 'PEN' ? 'S/ ' : cur + ' ') : c.pre;
+  return pre + fmtNum(v, c) + (c.post || '');
+}
+const dtoTxt = (antes, ahora) => { const d = Math.round((1 - ahora / antes) * 100); return d > 0 && d < 100 ? ' -' + d + '%' : ''; };
 
 function partir(ctx, texto, ancho) {
   const lineas = []; let l = '';
@@ -111,13 +147,13 @@ function partir(ctx, texto, ancho) {
 }
 
 // Busca el tamaño más grande que entra en la caja; si no entra ni al mínimo, corta con "…".
-function encajar(ctx, texto, w, h, bold, maxLineas = 4) {
+function encajar(ctx, texto, w, h, bold, maxLineas = 4, f = FUENTE) {
   for (let s = Math.floor(h * .9); s >= 10; s = Math.floor(s * .93)) {
-    ctx.font = `${bold ? 700 : 400} ${s}px ${FUENTE}`;
+    ctx.font = `${bold ? 700 : 400} ${s}px ${f}`;
     const ls = partir(ctx, texto, w);
     if (ls.length <= maxLineas && ls.length * s * 1.15 <= h && ls.every(x => ctx.measureText(x).width <= w)) return { s, ls };
   }
-  const s = 10; ctx.font = `${bold ? 700 : 400} ${s}px ${FUENTE}`;
+  const s = 10; ctx.font = `${bold ? 700 : 400} ${s}px ${f}`;
   const ls = partir(ctx, texto, w).slice(0, Math.max(1, Math.floor(h / (s * 1.15))));
   ls[ls.length - 1] += '…';
   return { s, ls };
@@ -125,11 +161,18 @@ function encajar(ctx, texto, w, h, bold, maxLineas = 4) {
 
 function textoEnCaja(ctx, texto, [x, y, w, h], c) {
   if (!texto) return;
-  const { s, ls } = encajar(ctx, texto, w, h, c.bold);
+  const { s, ls } = encajar(ctx, texto, w, h, c.bold, 4, fam(c));
   ctx.fillStyle = c.color; ctx.textBaseline = 'top';
   ctx.textAlign = c.align || 'left';
   const ax = c.align === 'center' ? x + w / 2 : c.align === 'right' ? x + w : x;
-  ls.forEach((l, i) => ctx.fillText(l, ax, y + i * s * 1.15));
+  ls.forEach((l, i) => {
+    const ty = y + i * s * 1.15;
+    ctx.fillText(l, ax, ty);
+    if (!c.tachar) return; // el precio de antes va cruzado por una linea, como en la tienda
+    const a = ctx.measureText(l).width;
+    const lx = c.align === 'center' ? ax - a / 2 : c.align === 'right' ? ax - a : ax;
+    ctx.fillRect(lx, ty + s * .55, a, Math.max(1, s * .07));
+  });
 }
 
 function contener(ctx, im, x, y, w, h) {
@@ -185,13 +228,16 @@ export async function dibujar(ctx, W, H, pl, fmt, prod, op = {}) {
       textoEnCaja(ctx, prod?.title || 'Título del producto', [x, y, w, h], c);
     } else if (id === 'precio') {
       if (c.bg) { ctx.fillStyle = c.bg; rrect(ctx, x, y, w, h, r); ctx.fill(); }
-      const p = prod ? fmtPrecio(prod.price) : 'S/ 999';
       const pad = c.bg ? h * .12 : 0;
-      if (prod?.oldPrice) {
-        const antes = [x + pad, y + pad, w - pad * 2, (h - pad * 2) * .32];
-        textoEnCaja(ctx, 'Antes ' + fmtPrecio(prod.oldPrice), antes, { color: c.color, align: c.align });
-        textoEnCaja(ctx, p, [x + pad, y + pad + (h - pad * 2) * .34, w - pad * 2, (h - pad * 2) * .66], { color: c.color, bold: true, align: c.align });
-      } else textoEnCaja(ctx, p, [x + pad, y + pad, w - pad * 2, h - pad * 2], { color: c.color, bold: true, align: c.align });
+      const bx = x + pad, by = y + pad, bw = w - pad * 2, bh = h - pad * 2;
+      const ahora = precioTxt(prod?.price, c, 999.9);
+      const viejo = prod?.oldPrice || (op.editor && c.antes === 'siempre' ? { v: 1299, cur: 'PEN' } : null);
+      if (viejo && c.antes !== 'nunca') {
+        const t = (c.antesPre == null ? 'Antes ' : c.antesPre) + precioTxt(viejo, c) + (c.antesPost || '')
+          + (c.dto && prod?.price ? dtoTxt(viejo.v, prod.price.v) : '');
+        textoEnCaja(ctx, t, [bx, by, bw, bh * .32], { ...c, color: c.antesColor || c.color, bold: false, tachar: c.antesTachado !== false });
+        textoEnCaja(ctx, ahora, [bx, by + bh * .34, bw, bh * .66], { ...c, bold: true, tachar: false });
+      } else textoEnCaja(ctx, ahora, [bx, by, bw, bh], { ...c, bold: true, tachar: false });
     } else if (id === 'texto') {
       textoEnCaja(ctx, c.texto, [x, y, w, h], c);
     }
@@ -275,11 +321,34 @@ export class Editor {
 // calidad. El lienzo se dibuja en 5 ms, así que ese segundo era casi todo el costo de un lote
 // (62.476 piezas = 17 h). Pasar el base64 a bytes a mano cuesta ~2 ms. Devuelve también `bytes`
 // para que quien arma un ZIP no tenga que volver a leer el blob.
-export async function renderPng(pl, fmt, prod, tipo = 'image/png') {
+// Salida de las piezas que van a un feed (Meta/TikTok) y se publican en GitHub Pages.
+// Se dibuja a tamaño completo (1080) y se entrega reducida: Meta pide 500x500 como mínimo
+// para catálogo y no muestra la pieza más grande que eso en ningún sitio del feed.
+// Medido el 2026-09-23 contra el sistema que ya lleva 2 meses en producción
+// (analyticsdatajg2025-cmd/GITHUB_FEED_LC: 600x600 calidad 80 -> 36-38 KB por pieza)
+// frente a nuestros 1080x1080 calidad 90 -> 116 KB. Con 15.619 productos eso es
+// 1,8 GB contra ~0,6 GB, y GitHub Pages recomienda no pasar de 1 GB por sitio.
+// Vive en este archivo a propósito: el `phash` de `js/auto.js` incluye el texto de
+// `lienzo.js`, así que cambiar estos números rehace todas las piezas en la próxima corrida.
+export const SALIDA_FEED = { lado: 600, calidad: .8 };
+
+export async function renderPng(pl, fmt, prod, tipo = 'image/png', salida = null) {
   const cv = document.createElement('canvas'); cv.width = fmt.w; cv.height = fmt.h;
   const r = await dibujar(cv.getContext('2d'), fmt.w, fmt.h, pl, fmt.id, prod);
-  let du;
-  try { du = cv.toDataURL(tipo, .9); } catch { throw new Error('el lienzo no se pudo exportar'); }
+  let du, lienzo = cv, calidad = .9;
+  if (salida && salida.lado > 0) {
+    const mayor = Math.max(fmt.w, fmt.h);
+    if (salida.lado < mayor) {
+      const k = salida.lado / mayor, ch = document.createElement('canvas');
+      ch.width = Math.max(1, Math.round(fmt.w * k)); ch.height = Math.max(1, Math.round(fmt.h * k));
+      const cx = ch.getContext('2d');
+      cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high';
+      cx.drawImage(cv, 0, 0, ch.width, ch.height);
+      lienzo = ch;
+    }
+    if (salida.calidad > 0) calidad = salida.calidad;
+  }
+  try { du = lienzo.toDataURL(tipo, calidad); } catch { throw new Error('el lienzo no se pudo exportar'); }
   if (!du || du.length < 100) throw new Error('el lienzo no se pudo exportar');
   const b64 = atob(du.slice(du.indexOf(',') + 1)), bytes = new Uint8Array(b64.length);
   for (let i = 0; i < b64.length; i++) bytes[i] = b64.charCodeAt(i);

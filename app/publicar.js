@@ -411,6 +411,29 @@ async function publicar(req, res, u, ctx) {
     if (!receta) return out(404, { error: 'No hay receta ' + slug });
     return out(200, { receta, estado: { ...vacio(), ...leerJson(path.join(dirAuto(slug), 'estado.json'), {}) } });
   }
+  // Log de cambios de un feed, leído del repo de su tienda (lo escribe app/pagina.js en cada corrida).
+  // Es lo mismo que muestra la página pública, pero sin salir del panel ni depender de internet.
+  if (req.method === 'GET' && accion === 'historial') {
+    const slug = u.searchParams.get('slug') || '';
+    if (!RUTA.test(slug)) return out(400, { error: 'Feed no válido' });
+    let corridas = leerJson(path.join(dirPages(slug), 'historial.json'), null)
+      || leerJson(path.join(dirAuto(slug), 'historial.json'), null) || [];
+    // Quien corre de verdad es GitHub, y su historial vive en el repo de allá: esta copia local puede
+    // no tenerlo nunca (nadie hace `git pull` aquí). Si falta, se lee de la propia URL pública del feed.
+    if (!corridas.length) {
+      let pages = c.pagesUrl;
+      try { pages = estadoRepos([slug.split('/')[0]])[slug.split('/')[0]].pages_url || pages; } catch { /* sin git */ }
+      if (pages) try {
+        const r = await fetch(`${pages}/${slug}/historial.json`, { signal: AbortSignal.timeout(8000) });
+        if (r.ok) { const d = await r.json(); if (Array.isArray(d)) corridas = d; }
+      } catch { /* sin internet o el feed todavía no corrió: la tabla queda vacía */ }
+    }
+    const manual = leerJson(path.join(dirAuto(slug), 'manual.json'), null);
+    // Últimas líneas del log de «Generar en esta PC»: es donde aparece el motivo real de una falla.
+    let log = '';
+    try { log = fs.readFileSync(path.join(dirAuto(slug), 'manual.log'), 'utf8').split('\n').slice(-40).join('\n').slice(-4000); } catch { /* nunca se generó aquí */ }
+    return out(200, { slug, corridas: Array.isArray(corridas) ? corridas.slice(0, 60) : [], ultimo_manual: manual || null, log });
+  }
   if (req.method !== 'POST') return out(405, { error: 'Método no permitido' });
   // Subir a GitHub lo que hay ahora (código + recetas) y, si se pide, disparar una corrida ya mismo.
   // Es el mismo trabajo de SUBIR-REPO.bat, hecho desde el panel «Mis feeds».

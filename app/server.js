@@ -43,6 +43,9 @@ const TABLAS = {
   tareas_tienda: ['id', 'campaign_id', 'store_id', 'titulo', 'guia', 'vence', 'estado', 'evidencia', 'nota', 'quien', 'actualizado'],
   comunicados: ['id', 'titulo', 'cuerpo', 'marca', 'zonas', 'prioridad', 'estado', 'vence', 'quien', 'creado', 'actualizado'],
   comunicados_leidos: ['id', 'comunicado_id', 'store_id', 'quien', 'cuando'],
+  // Estilo por marca (Biblioteca de marca): una fila por marca, la llave es el nombre de la marca.
+  // El logo se guarda como data URL; lo achica el navegador antes de mandarlo (LOGO_LADO).
+  marcas_estilo: ['marca', 'logo', 'fuente', 'c1', 'c2', 'acento', 'nota', 'actualizado'],
   // Feed saliente de la Fábrica (lo escribe publicar.js, no se hace POST directo)
   publicaciones: ['id', 'campaign_id', 'formato', 'productos', 'url_feed', 'destino', 'creado'],
 };
@@ -331,6 +334,31 @@ function opLeido(fila, out) {
   out(200, l);
 }
 
+// Estilo de una marca: se valida porque el logo es lo único que esta app guarda como imagen
+// subida por una persona. Nada de URLs externas (la pieza se dibuja sin internet en el runner) ni
+// de un data URL sin tope: un logo de 5 MB dentro de la plantilla revienta el pedido de lote.
+const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+const LOGO_RE = /^data:image\/(png|jpeg|webp|svg\+xml);(base64,|charset=utf-8,|,)?/;
+const LOGO_MAX = 2e6;
+function opEstiloMarca(e, out) {
+  if (!MARCAS.includes(e.marca)) return out(400, { error: 'Marca no válida: ' + MARCAS.join(', ') });
+  const logo = String(e.logo || '');
+  if (logo) {
+    if (!LOGO_RE.test(logo)) return out(400, { error: 'El logo tiene que ser una imagen subida (PNG, JPG, WEBP o SVG), no una URL' });
+    if (logo.length > LOGO_MAX) return out(400, { error: `El logo pesa ${(logo.length / 1e6).toFixed(1)} MB; el tope es 2 MB` });
+  }
+  const fuente = String(e.fuente || '');
+  if (fuente && (fuente.length > 80 || /[<>{};]/.test(fuente))) return out(400, { error: 'Tipografía no válida' });
+  for (const k of ['c1', 'c2', 'acento']) if (e[k] && !COLOR_RE.test(String(e[k]))) return out(400, { error: 'Color no válido en ' + k });
+  if (String(e.nota || '').length > 300) return out(400, { error: 'La nota no puede pasar de 300 caracteres' });
+  const filas = leerCsv('marcas_estilo'), i = filas.findIndex(r => r.marca === e.marca);
+  const limpia = Object.fromEntries(TABLAS.marcas_estilo.map(c => [c, e[c] ?? (i >= 0 ? filas[i][c] : '')]));
+  limpia.actualizado = new Date().toISOString();
+  if (i >= 0) filas[i] = limpia; else filas.push(limpia);
+  escribirCsv('marcas_estilo', filas);
+  out(200, limpia);
+}
+
 function api(req, res, t, u) {
   const out = (code, d) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(d)); };
   if (!Object.hasOwn(TABLAS, t)) return out(404, { error: 'Tabla desconocida' });
@@ -365,6 +393,7 @@ function api(req, res, t, u) {
         if (t === 'aprobaciones') return opAprob(fila, out);
         if (t === 'comunicados') return opComunicado(fila, out);
         if (t === 'comunicados_leidos') return opLeido(fila, out);
+        if (t === 'marcas_estilo') return opEstiloMarca(fila, out);
         if (t === 'feeds') {
           const url = String(fila.url || '');
           if (!url.startsWith('archivo:') && !permitido(url)) return out(400, { error: 'Feed fuera de los dominios permitidos (PERMITIDOS en app/server.js)' });

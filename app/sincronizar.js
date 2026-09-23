@@ -83,7 +83,18 @@ function sincronizar(tienda, slugs) {
   const repo = rem.ok ? nombreRepo(rem.salida) : '';
   if (!repo) throw new Error(`repo-${tienda} no tiene un remoto de GitHub. Corre SUBIR-REPO.bat una vez.`);
 
-  git(d, ['add', '-A']);
+  // Quien manda en `docs/` es el workflow, que commitea allá en cada corrida; esta máquina
+  // nunca hace `git pull` y su carpeta `docs/` está vacía a propósito (las piezas pesan GB).
+  // Así que antes de empujar se reengancha a lo que hay en GitHub: se baja el árbol SIN los
+  // blobs (`--filter=blob:none`, GitHub lo soporta), se planta HEAD sobre `origin/<rama>`
+  // dejando el índice como está allá, y se agrega solo lo nuestro **excluyendo `docs`**.
+  // De ese modo `docs/` del remoto se conserva intacto y el push deja de salir «fetch first».
+  const rama0 = git(d, ['rev-parse', '--abbrev-ref', 'HEAD'], true).salida || 'main';
+  const traido = git(d, ['fetch', '--filter=blob:none', 'origin', rama0], true);
+  if (traido.ok && git(d, ['rev-parse', '--verify', 'origin/' + rama0], true).ok) {
+    git(d, ['reset', '--mixed', 'origin/' + rama0], true);
+  }
+  git(d, ['add', '-A', '--', '.', ':(exclude)docs']);
   const hay = git(d, ['diff', '--cached', '--quiet'], true); // sale con error = sí hay cambios
   let commit = '';
   if (!hay.ok) {

@@ -3,9 +3,10 @@
 // la plantilla, el formato, el código de dibujo (lienzo.js) o los datos del producto que salen en ella.
 import { formatos } from './config.js';
 import { leerFeed, filaMeta } from './feeds.js';
-import { renderPng } from './lienzo.js';
+import { renderPng, SALIDA_FEED } from './lienzo.js';
 
 const HILOS = 6, AVISO_CADA = 500;
+const ESPERAS = [5000, 15000, 40000]; // reintentos de foto, en ms
 const params = new URLSearchParams(location.search), slug = params.get('slug') || '';
 const limite = Number(params.get('limite')) || 0; // solo para pruebas: corta el feed a N productos
 // Reparto en varias máquinas (app/publica.js): esta página dibuja 1 de cada `de` productos.
@@ -93,9 +94,15 @@ async function correr() {
       if (enHosting.has(t.archivo)) res[n] = t;
       else if (Date.now() > plazo) { res[n] = anterior(t); if (!res[n]) fuera.pendientes++; }
       else {
-        let { blob, sinFoto } = await renderPng(receta.plantilla, fmt, t.p, 'image/jpeg');
-        // Las tiendas frenan muchas descargas seguidas: una segunda oportunidad unos segundos después.
-        if (sinFoto) { await new Promise(r => setTimeout(r, 5000)); ({ blob, sinFoto } = await renderPng(receta.plantilla, fmt, t.p, 'image/jpeg')); }
+        let { blob, sinFoto } = await renderPng(receta.plantilla, fmt, t.p, 'image/jpeg', SALIDA_FEED);
+        // Las tiendas frenan muchas descargas seguidas (lacuracao.pe devuelve 502 y 503 en rachas).
+        // Espera creciente, como el sistema que ya lleva 2 meses en producción (backoff 1,5):
+        // con un solo reintento a los 5 s, una racha de 30 s dejaba el producto fuera del CSV.
+        for (const espera of ESPERAS) {
+          if (!sinFoto) break;
+          await new Promise(r => setTimeout(r, espera));
+          ({ blob, sinFoto } = await renderPng(receta.plantilla, fmt, t.p, 'image/jpeg', SALIDA_FEED));
+        }
         if (sinFoto) { res[n] = anterior(t); if (!res[n]) fuera['sin foto']++; } // la foto no cargó: mejor fuera que una pieza vacía
         else {
           await pedir(`/publicar/auto-img${q}&archivo=${encodeURIComponent(t.archivo)}`, { method: 'POST', headers: { 'Content-Type': 'image/jpeg' }, body: blob });
