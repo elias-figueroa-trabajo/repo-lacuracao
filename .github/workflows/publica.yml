@@ -106,7 +106,10 @@ jobs:
     needs: recetas
     if: needs.recetas.outputs.matriz != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    # 45 min, no 330. Una parte sana termina en minutos (12 hilos, y solo dibuja lo que falta);
+    # si una pasa de 45 es porque la tienda corto esa maquina, y lo util es que muera rapido para
+    # que `reintenta.yml` pida otra maquina, no que se quede cuatro horas en pie.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 20

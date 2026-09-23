@@ -5,7 +5,7 @@ import { formatos } from './config.js';
 import { leerFeed, filaMeta } from './feeds.js';
 import { renderPng, SALIDA_FEED } from './lienzo.js';
 
-const HILOS = 2, AVISO_CADA = 200;
+const HILOS = 12, AVISO_CADA = 200;
 const ESPERAS = [5000, 15000, 40000]; // reintentos de foto, en ms
 // Cuando la tienda corta en seco (todas las fotos dan 502/503 en esa maquina) la espera creciente
 // se vuelve una trampa: 60 s por producto, y una parte entera se va en horas antes de morir.
@@ -13,13 +13,16 @@ const ESPERAS = [5000, 15000, 40000]; // reintentos de foto, en ms
 // dibujadas, 4 h en pie y la corrida completa perdida porque `unir` no llega a correr.
 const RAFAGA = 10;        // fallos seguidos a partir de los cuales ya no se reintenta (no es transitorio)
 const CORTE = 40;         // fallos seguidos = la tienda nos corto, no son fotos rotas sueltas
-const PAUSA = 180e3;      // tregua antes de volver a intentar
-const PAUSAS_MAX = 3;     // a la tercera se abandona la parte con un mensaje claro
+const PAUSA = 60e3;       // tregua antes de volver a intentar
+const PAUSAS_MAX = 2;     // treguas permitidas; en el corte siguiente se abandona la parte
 const params = new URLSearchParams(location.search), slug = params.get('slug') || '';
 const limite = Number(params.get('limite')) || 0; // solo para pruebas: corta el feed a N productos
-// Reparto en varias máquinas (app/publica.js): esta página dibuja 1 de cada `de` productos.
-// Por número de orden y no por bloques, así todas las partes tardan parecido aunque el feed
-// venga ordenado por categoría. Sin estos parámetros, 0 de 1 = el catálogo entero, como siempre.
+// Reparto en varias máquinas (app/publica.js): esta página dibuja los productos que le tocan.
+// Por el sku y no por el número de orden: cada parte lee el feed por su cuenta, en su propia máquina
+// y a su hora, así que si la tienda cambia el feed entre una lectura y otra, repartir por posición
+// corre un lugar todo lo que viene después — productos que no dibuja nadie y otros dibujados dos
+// veces. Con el sku, un producto cae siempre en la misma parte, lo lea quien lo lea.
+// Sin estos parámetros, 0 de 1 = el catálogo entero, como siempre.
 const parte = Number(params.get('parte')) || 0, de = Math.max(1, Number(params.get('de')) || 1);
 // Con reparto, aunque sea de una sola parte, las filas van a `partes/` y el CSV lo escribe el paso de unir.
 const repartido = params.has('parte');
@@ -47,6 +50,11 @@ window.onerror = (m, f, l) => cortar(`${m} (${f}:${l})`);
 window.onunhandledrejection = e => cortar(e.reason);
 
 // Nombre de archivo = sku limpio + inicio de la firma: mismo producto y mismo diseño → mismo nombre.
+const dondeVa = sku => { // FNV-1a: reparto estable y parejo a partir del sku
+  const s = String(sku); let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0) % de;
+};
 const archivoDe = (sku, firma) => {
   let s = String(sku).replace(/[^\w.-]+/g, '-').slice(0, 90);
   if (!/^[A-Za-z0-9]/.test(s)) s = 'p' + s;
@@ -71,7 +79,7 @@ async function correr() {
     prods = await leerFeed(receta.feed_url);
   }
   if (limite) prods = prods.slice(0, limite);
-  if (de > 1) { const todos = prods.length; prods = prods.filter((_, n) => n % de === parte); await progreso(`Parte ${parte} de ${de}: ${prods.length} de ${todos} productos`); }
+  if (de > 1) { const todos = prods.length; prods = prods.filter(p => dondeVa(p.sku) === parte); await progreso(`Parte ${parte} de ${de}: ${prods.length} de ${todos} productos`); }
   await progreso(`${prods.length} productos en el feed`);
 
   const fuera = { 'sin foto': 0, 'sin precio': 0, 'sin link': 0, 'repetidos': 0, 'pendientes': 0 }, cola = [], ids = new Set();
@@ -94,7 +102,8 @@ async function correr() {
   async function frenar() {
     if (tregua) return tregua;
     if (++pausas > PAUSAS_MAX) {
-      throw new Error(`La tienda dejo de entregar fotos: ${CORTE} seguidas fallaron ${PAUSAS_MAX} veces seguidas. `
+      throw new Error(`La tienda dejo de entregar fotos: otras ${CORTE} seguidas fallaron despues de `
+        + `${PAUSAS_MAX} treguas de ${PAUSA / 60e3} min. `
         + `Se abandona esta parte en vez de quemar el plazo (se rehace en la proxima corrida).`);
     }
     tregua = (async () => {
@@ -113,6 +122,9 @@ async function correr() {
   };
   async function hilo() {
     while (!cortado && i < cola.length) {
+      // La tregua es de los dos hilos, no solo del que la pidio: si no, el otro sigue descargando
+      // durante los 3 min, y una foto suya que salga bien pone `seguidas` en cero y borra el freno.
+      if (tregua) { await tregua; continue; }
       const n = i++, t = cola[n];
       if (enHosting.has(t.archivo)) res[n] = t;
       else if (Date.now() > plazo) { res[n] = anterior(t); if (!res[n]) fuera.pendientes++; }
@@ -123,7 +135,7 @@ async function correr() {
         // con un solo reintento a los 5 s, una racha de 30 s dejaba el producto fuera del CSV.
         for (const espera of ESPERAS) {
           // En plena racha de fallos no se reintenta: esperar 60 s por producto solo alarga la agonia.
-          if (!sinFoto || seguidas >= RAFAGA) break;
+          if (!sinFoto || seguidas >= RAFAGA || tregua) break;
           await new Promise(r => setTimeout(r, espera));
           ({ blob, sinFoto } = await renderPng(receta.plantilla, fmt, t.p, 'image/jpeg', SALIDA_FEED));
         }

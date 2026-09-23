@@ -1,0 +1,40 @@
+# Reintento automatico de una corrida de feeds que fallo por bloqueo de la tienda.
+# En el repo va como .github/workflows/reintenta.yml (lo copia app/armar-repo.js).
+#
+# Por que existe: lacuracao.pe tiene un WAF que corta la IP ENTERA de una maquina de Actions.
+# Cuando le toca a una parte, esa maquina recibe 502 en TODAS las fotos, la parte muere y `unir`
+# no corre: la corrida completa se pierde aunque las otras 7 partes hayan terminado en minutos
+# (paso el 2026-09-23 con las partes 5 y 6 de 8). La solucion no es esperar mas: es pedir otra
+# maquina. «Volver a correr los jobs fallidos» conserva lo que ya salio bien (sus artefactos
+# siguen colgados de la MISMA corrida) y solo repite los que murieron, en una maquina nueva
+# con otra IP. Asi la corrida termina publicando y cada parte sigue tardando menos de 10 minutos.
+#
+# Va en un workflow aparte a proposito: la API rerun-failed-jobs rechaza una corrida que todavia
+# esta en curso, asi que esto no puede ser un job de la propia corrida. `workflow_run` dispara
+# recien cuando la otra termino.
+name: Reintentar feeds
+
+on:
+  workflow_run:
+    workflows: ['Feeds a Pages']
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  reintentar:
+    # Hasta 3 intentos: si tres maquinas distintas fallan no es la IP, es algo nuestro, y seguir
+    # reintentando solo quema minutos y tapa el error real.
+    if: ${{ github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt < 3 }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pedir otra maquina para las partes que fallaron
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORRIDA: ${{ github.event.workflow_run.id }}
+          INTENTO: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          echo "La corrida $CORRIDA fallo en el intento $INTENTO; se repiten solo los jobs fallidos."
+          gh api --method POST -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${CORRIDA}/rerun-failed-jobs"

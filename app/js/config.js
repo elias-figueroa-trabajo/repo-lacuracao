@@ -39,4 +39,18 @@ export const MARCAS_INFO = [
 ];
 export const MARCAS = MARCAS_INFO.map(m => m.n);
 // Marca con la que se está trabajando (selector al pie del menú). '' = todas.
-export const marcaActual = () => { try { return localStorage.getItem('efe_marca') || ''; } catch { return ''; } };
+// Marca de trabajo. Se valida contra MARCAS: si quedó guardada una marca retirada, el menú la
+// pinta como «Todas las marcas» pero las pantallas seguirían filtrando por ella y no se vería
+// ninguna campaña ni pedido. El valor vive también en memoria para que, si localStorage falla
+// (incógnito, cuota), lo que se pinta y lo que se filtra no se separen.
+let marcaMem = null;
+export const marcaActual = () => {
+  if (marcaMem === null) { try { marcaMem = localStorage.getItem('efe_marca') || ''; } catch { marcaMem = ''; } }
+  return MARCAS.includes(marcaMem) ? marcaMem : '';
+};
+// Única puerta de escritura: devuelve la marca que realmente quedó puesta.
+export const guardarMarca = m => {
+  marcaMem = MARCAS.includes(m) ? m : '';
+  try { localStorage.setItem('efe_marca', marcaMem); } catch {}
+  return marcaMem;
+};

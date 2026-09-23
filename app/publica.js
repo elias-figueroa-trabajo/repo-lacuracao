@@ -107,7 +107,7 @@ async function dibujar(slug, chrome) {
     const t0 = Date.now();
     while (!fs.existsSync(fin)) {
       if (salio) throw new Error('El navegador se cerró antes de terminar');
-      if (Date.now() - t0 > ESPERA_MAX) throw new Error('Pasaron 6 h sin terminar');
+      if (Date.now() - t0 > ESPERA_MAX) throw new Error(`Pasaron ${ESPERA_MAX / 3600e3} h sin terminar`);
       await dormir(2000);
     }
     await dormir(300); // que termine de escribirse
@@ -174,8 +174,10 @@ async function main() {
 
   const paso = UNIR ? 'Unir' : DE > 1 ? `Parte ${PARTE} de ${DE}` : 'Corrida completa';
   // Log de cambios en la propia URL del feed: historial.json + index.html + portada del repo.
-  // Solo lo escribe quien cierra la corrida (unir, o la corrida completa sin reparto).
-  if (UNIR || DE === 1) {
+  // Solo lo escribe quien cierra la corrida (unir, o la corrida completa sin reparto). OJO con
+  // `DE === 1`: el workflow siempre pasa `--parte`, asi que un feed de una sola parte entraba aqui
+  // al dibujar y anotaba la corrida como exitosa antes de que `unir` escribiera el CSV.
+  if (UNIR || !REPARTIDO) {
     try {
       const paginas = escribirPaginas(PAGES, slug, PUBLICA + '/' + slug + '/feed.csv', process.env.GITHUB_REPOSITORY || '',
         { productos: r.productos, nuevas: r.nuevas, reusadas: r.reusadas, retiradas: r.retiradas, borradas: r.borradas, paso });
