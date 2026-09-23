@@ -9,7 +9,6 @@ const fs = require('fs');
 const path = require('path');
 const { publicar, servirPub } = require('./publicar.js');
 const { magento } = require('./magento.js');
-const { lote } = require('./lotes.js');
 
 const PORT = Number(process.env.PORT) || 5180;
 const ROOT = __dirname;
@@ -23,7 +22,7 @@ const TABLAS = {
   campanas: ['campaign_id', 'nombre', 'marca', 'anunciante', 'inicio', 'fin', 'estado', 'dueno', 'canales', 'objetivo', 'notas', 'aprobado_por', 'aprobado_en', 'creado', 'actualizado'],
   feeds: ['id', 'url', 'nombre', 'productos', 'leido', 'bajado', 'error'], // bajado y error los escribe solo el servidor
   plantillas: ['id', 'nombre', 'datos', 'actualizado'],
-  lotes: ['id', 'campaign_id', 'plantilla_id', 'formatos', 'skus', 'piezas', 'creado'],
+  lotes: ['id', 'campaign_id', 'plantilla_id', 'formatos', 'skus', 'piezas', 'creado'], // historial: el lote en ZIP se retiró el 2026-09-22; solo lo lee el calendario
   pedidos: ['id', 'campaign_id', 'tipo', 'titulo', 'detalle', 'marca', 'solicitante', 'responsable', 'prioridad', 'estado', 'vence', 'version', 'enlace', 'creado', 'actualizado', 'respondido', 'cerrado'],
   pedidos_historial: ['id', 'pedido_id', 'cuando', 'quien', 'accion', 'texto', 'version', 'enlace'],
   links: ['id', 'campaign_id', 'canal', 'destino', 'source', 'medium', 'content', 'url', 'marca', 'quien', 'creado'],
@@ -558,7 +557,6 @@ function atender(req, res) {
   if (u.pathname.startsWith('/api/')) return api(req, res, u.pathname.slice(5), u);
   if (u.pathname.startsWith('/feeds/')) return rutaFeeds(req, res, u);
   if (u.pathname.startsWith('/publicar/')) return rutaPublicar(req, res, u);
-  if (u.pathname.startsWith('/lote/')) return rutaLote(req, res, u);
   if (u.pathname.startsWith('/pub/')) return servirPub(req, res, u);
   if (u.pathname.startsWith('/magento/')) return magento(req, res, u, { local: 'http://localhost:' + PORT });
   const f = path.join(ROOT, decodeURIComponent(u.pathname === '/' ? '/index.html' : u.pathname));
@@ -584,12 +582,6 @@ function ctxLocal(req, res) {
     req.on('error', mal);
   });
   return { out, cuerpo, permitido, local: 'http://localhost:' + PORT };
-}
-
-// Lotes grandes por GitHub Actions (lotes.js).
-function rutaLote(req, res, u) {
-  const ctx = ctxLocal(req, res);
-  if (ctx) lote(req, u, ctx).catch(e => ctx.out(400, { error: e.message }));
 }
 
 // Feed saliente (publicar.js).
