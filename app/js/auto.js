@@ -98,13 +98,20 @@ async function correr() {
   const res = new Array(cola.length);
   let i = 0, hechas = 0, dibujadas = 0, atrasadas = 0;
   // Freno de tienda caida: lo comparten los hilos, asi una sola tregua los para a todos.
-  let seguidas = 0, pausas = 0, tregua = null;
+  let seguidas = 0, pausas = 0, tregua = null, bloqueada = false, saltadas = 0;
   async function frenar() {
     if (tregua) return tregua;
     if (++pausas > PAUSAS_MAX) {
-      throw new Error(`La tienda dejo de entregar fotos: otras ${CORTE} seguidas fallaron despues de `
-        + `${PAUSAS_MAX} treguas de ${PAUSA / 60e3} min. `
-        + `Se abandona esta parte en vez de quemar el plazo (se rehace en la proxima corrida).`);
+      // La tienda corto a ESTA maquina (su WAF bloquea la IP entera del runner: todas las fotos dan
+      // 502/503). Antes se tiraba la parte, y como `unir` exige que las 8 partes salgan bien, una sola
+      // maquina bloqueada perdia la corrida completa y no se publicaba nada. Ahora la parte NO muere:
+      // se deja de pedir fotos y cada producto que falta sale con su pieza anterior, que `anterior()`
+      // solo devuelve si muestra el mismo precio. Asi el CSV se publica igual y la proxima corrida
+      // (otra maquina, otra IP) redibuja lo que quedo con firma vieja. Solo cae el producto cuyo precio
+      // cambio y cuya foto no se pudo bajar: uno suelto fuera del feed, no el feed entero.
+      bloqueada = true;
+      await progreso(`La tienda corto las fotos en esta maquina: se sigue con las piezas ya publicadas`);
+      return;
     }
     tregua = (async () => {
       await progreso(`${CORTE} fotos seguidas fallaron: tregua de ${PAUSA / 60e3} min (pausa ${pausas} de ${PAUSAS_MAX})`);
@@ -127,6 +134,7 @@ async function correr() {
       if (tregua) { await tregua; continue; }
       const n = i++, t = cola[n];
       if (enHosting.has(t.archivo)) res[n] = t;
+      else if (bloqueada) { res[n] = anterior(t); if (!res[n]) fuera['sin foto']++; saltadas++; }
       else if (Date.now() > plazo) { res[n] = anterior(t); if (!res[n]) fuera.pendientes++; }
       else {
         let { blob, sinFoto } = await renderPng(receta.plantilla, fmt, t.p, 'image/jpeg', SALIDA_FEED);
@@ -151,6 +159,7 @@ async function correr() {
   }
   await Promise.all(Array.from({ length: HILOS }, hilo));
   if (cortado) return;
+  if (bloqueada) await progreso(`Tienda bloqueada: ${saltadas} productos salieron con su pieza anterior`);
 
   const filas = res.filter(Boolean).map(t => ({ ...t.fila, _img: t.archivo, _firma: t.firma, _pf: t.pf }));
   if (!filas.length) throw new Error('Ningún producto quedó apto: ' + JSON.stringify(fuera) + ' (revisa fotos, precio y link)');

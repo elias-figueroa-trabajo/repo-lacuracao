@@ -36,5 +36,12 @@ jobs:
           INTENTO: ${{ github.event.workflow_run.run_attempt }}
         run: |
           echo "La corrida $CORRIDA fallo en el intento $INTENTO; se repiten solo los jobs fallidos."
-          gh api --method POST -H "Accept: application/vnd.github+json" \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${CORRIDA}/rerun-failed-jobs"
+          # La respuesta se guarda y se muestra en el resumen de la corrida: si GitHub rechaza el
+          # reintento (el log de este workflow no se puede leer sin token) el motivo queda a la vista.
+          gh api --method POST -H "Accept: application/vnd.github+json" "repos/${GITHUB_REPOSITORY}/actions/runs/${CORRIDA}/rerun-failed-jobs" > respuesta.txt 2>&1 && ok=si || ok=no
+          { echo "Corrida $CORRIDA, intento $INTENTO, reintento pedido: $ok"; echo '```'; cat respuesta.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat respuesta.txt
+          # Que GitHub no deje reintentar no es una falla del feed: desde el 2026-09-23 una maquina
+          # bloqueada por la tienda ya no tumba su parte (js/auto.js sigue con las piezas ya publicadas),
+          # asi que esto es solo la red de seguridad. No se pinta la corrida de rojo por eso.
+          exit 0
